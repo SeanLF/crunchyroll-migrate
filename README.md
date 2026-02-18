@@ -149,6 +149,9 @@ Files are written atomically (temp file + rename) to prevent corruption on inter
 ## Development
 
 ```bash
+# Set up git hooks (format + clippy on commit, tests on push)
+git config core.hooksPath .githooks
+
 # Build
 cargo build
 

@@ -365,14 +365,23 @@ async fn import_history(
             let cr = crunchy.clone();
             let account_id = account_id.clone();
             let content_id = item.content_id.clone();
+            let playhead = item.playhead;
+            let fully_watched = item.fully_watched;
             let label = if item.title.is_empty() {
                 format!("{} - {}", item.series_title, item.content_id)
             } else {
                 format!("{} - {}", item.series_title, item.title)
             };
             async move {
-                let result =
-                    retry_with_backoff(|| mark_as_watched(&cr, &account_id, &content_id)).await;
+                let result = if fully_watched {
+                    retry_with_backoff(|| mark_as_watched(&cr, &account_id, &content_id)).await
+                } else if playhead > 0 {
+                    // Restore playhead so the user can resume where they left off
+                    retry_with_backoff(|| set_playhead(&cr, &account_id, &content_id, playhead))
+                        .await
+                } else {
+                    Ok(())
+                };
                 tokio::time::sleep(WRITE_DELAY).await;
                 (label, result)
             }
@@ -396,26 +405,62 @@ async fn import_history(
     Ok(c)
 }
 
+async fn set_playhead(
+    crunchy: &Crunchyroll,
+    account_id: &str,
+    content_id: &str,
+    playhead: u32,
+) -> Result<()> {
+    let url = format!(
+        "https://www.crunchyroll.com/content/v2/{}/playheads",
+        account_id
+    );
+    let status = crunchy
+        .client()
+        .post(&url)
+        .header(
+            "Authorization",
+            format!("Bearer {}", crunchy.access_token().await),
+        )
+        .json(&serde_json::json!({
+            "content_id": content_id,
+            "playhead": playhead
+        }))
+        .send()
+        .await?
+        .status()
+        .as_u16();
+
+    check_status(status, "set_playhead", content_id)
+}
+
 async fn mark_as_watched(crunchy: &Crunchyroll, account_id: &str, content_id: &str) -> Result<()> {
     let url = format!(
         "https://www.crunchyroll.com/content/v2/discover/{}/mark_as_watched/{}",
         account_id, content_id
     );
-    let client = crunchy.client();
-    let token = crunchy.access_token().await;
-
-    let resp = client
+    let status = crunchy
+        .client()
         .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
+        .header(
+            "Authorization",
+            format!("Bearer {}", crunchy.access_token().await),
+        )
         .json(&serde_json::json!({}))
         .send()
-        .await?;
+        .await?
+        .status()
+        .as_u16();
 
-    let status = resp.status();
-    if status.is_success() || status.as_u16() == 409 {
+    check_status(status, "mark_as_watched", content_id)
+}
+
+/// Treat 2xx and 409 (already exists) as OK; fail on anything else.
+fn check_status(status: u16, operation: &str, content_id: &str) -> Result<()> {
+    if (200..300).contains(&status) || status == 409 {
         Ok(())
     } else {
-        anyhow::bail!("mark_as_watched returned {} for {}", status, content_id)
+        anyhow::bail!("{} returned {} for {}", operation, status, content_id)
     }
 }
 

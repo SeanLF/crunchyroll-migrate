@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -e
+
+# Resolve cargo via mise if available, otherwise expect it in PATH
+run() { if command -v mise >/dev/null 2>&1; then mise exec -- "$@"; else "$@"; fi; }
+
+echo "pre-commit: checking format..."
+run cargo fmt --check
+
+echo "pre-commit: running clippy..."
+run cargo clippy --all-targets -- -D warnings
