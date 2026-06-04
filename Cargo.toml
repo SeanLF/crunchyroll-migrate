@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/SeanLF/crunchyroll-migrate"
 
 [dependencies]
-crunchyroll-rs = "0.16"
+crunchyroll-rs = "0.17"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
