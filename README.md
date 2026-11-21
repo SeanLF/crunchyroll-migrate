@@ -1,8 +1,20 @@
 # crunchyroll-migrate
 
-Migrate Crunchyroll profile data between accounts. Exports and imports watchlists, watch history, crunchylists, and ratings -- with a live terminal dashboard, automatic retries, and pre-filtering so nothing gets duplicated.
+Copy Crunchyroll profile data between profiles and accounts. Exports and imports watchlists, watch history, crunchylists, and ratings, with a live terminal view, automatic retries, and pre-filtering so nothing gets duplicated.
 
-Built because Crunchyroll has no account merge or profile transfer feature, and the existing Google Apps Script tools break constantly (manual bearer tokens, no pagination, silent data loss).
+## Try Crunchyroll's own transfer first
+
+Crunchyroll now has an official [profile transfer](https://help.crunchyroll.com/article/how-to-transfer-a-profile) (avatar › Transfer Profile). It moves a whole profile, with its watch history and lists, to another account as a new profile, once the current account holder approves. If that's what you want, use it.
+
+Use this tool when you need something it doesn't do:
+
+| | Official transfer | crunchyroll-migrate |
+|---|---|---|
+| Source profile afterwards | Moved off the source account | Untouched (it's a copy) |
+| Into an existing profile | No, arrives as a new profile | Yes, merges and skips what's already there |
+| Primary profile | Can't be transferred | Works |
+| Approval | Account holder approves by email, within 7 days | None; you sign in to both sides |
+| Backup / preview | No | JSON export, `diff` before copying |
 
 ## What it moves
 
