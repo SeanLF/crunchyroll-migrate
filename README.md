@@ -4,7 +4,7 @@ Copy Crunchyroll profile data between profiles and accounts. Exports and imports
 
 ## Try Crunchyroll's own transfer first
 
-Crunchyroll now has an official [profile transfer](https://help.crunchyroll.com/article/creating-multiple-profiles) (avatar › Transfer Profile). It moves a whole profile, with its watch history and lists, to another account as a new profile, once the current account holder approves. If that's what you want, use it.
+Crunchyroll now has an official [profile transfer](https://help.crunchyroll.com/article/how-to-transfer-a-profile) (avatar › Transfer Profile). It moves a whole profile, with its watch history and lists, to another account as a new profile, once the current account holder approves. If that's what you want, use it.
 
 Use this tool when you need something it doesn't do:
 
