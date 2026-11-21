@@ -1,5 +1,4 @@
 mod auth;
-mod diff;
 mod export;
 mod import;
 mod models;
@@ -9,7 +8,11 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use crunchyroll_rs::list::WatchlistOptions;
 use futures_util::StreamExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use ui::{Session, Stage};
+
+/// Watch history page size. The library default (20) makes large histories crawl.
+pub const HISTORY_PAGE_SIZE: u32 = 100;
 
 #[derive(Parser)]
 #[command(name = "crunchyroll-migrate")]
@@ -23,20 +26,18 @@ struct Cli {
 enum Command {
     /// Show account info, profiles, and data counts
     Status {
+        /// `etp_rt` cookie from a logged-in crunchyroll.com browser session (prompted if omitted)
         #[arg(long)]
-        email: Option<String>,
-        #[arg(long)]
-        password: Option<String>,
+        cookie: Option<String>,
         #[arg(long)]
         profile: Option<String>,
     },
 
     /// Export one profile's data to JSON files
     Export {
+        /// `etp_rt` cookie from a logged-in crunchyroll.com browser session (prompted if omitted)
         #[arg(long)]
-        email: Option<String>,
-        #[arg(long)]
-        password: Option<String>,
+        cookie: Option<String>,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long, default_value = "./export")]
@@ -45,10 +46,9 @@ enum Command {
 
     /// Import from JSON files into a profile
     Import {
+        /// `etp_rt` cookie from a logged-in crunchyroll.com browser session (prompted if omitted)
         #[arg(long)]
-        email: Option<String>,
-        #[arg(long)]
-        password: Option<String>,
+        cookie: Option<String>,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long, default_value = "./export")]
@@ -59,10 +59,9 @@ enum Command {
 
     /// Compare exported data against target account
     Diff {
+        /// `etp_rt` cookie from a logged-in crunchyroll.com browser session (prompted if omitted)
         #[arg(long)]
-        email: Option<String>,
-        #[arg(long)]
-        password: Option<String>,
+        cookie: Option<String>,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long, short = 'i', default_value = "./export")]
@@ -71,10 +70,9 @@ enum Command {
 
     /// Rename a profile on the account
     RenameProfile {
+        /// `etp_rt` cookie from a logged-in crunchyroll.com browser session (prompted if omitted)
         #[arg(long)]
-        email: Option<String>,
-        #[arg(long)]
-        password: Option<String>,
+        cookie: Option<String>,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long)]
@@ -83,256 +81,369 @@ enum Command {
 
     /// Full flow: export -> diff -> confirm -> import
     Migrate {
+        /// `etp_rt` cookie from a logged-in crunchyroll.com browser session (prompted if omitted)
         #[arg(long)]
-        source_email: Option<String>,
-        #[arg(long)]
-        source_password: Option<String>,
+        source_cookie: Option<String>,
         #[arg(long)]
         source_profile: Option<String>,
+        /// Target account's `etp_rt` cookie (prompted if omitted; leave the prompt empty to copy
+        /// between profiles on the source account)
         #[arg(long)]
-        target_email: Option<String>,
-        #[arg(long)]
-        target_password: Option<String>,
+        target_cookie: Option<String>,
         #[arg(long)]
         target_profile: Option<String>,
+        /// Where the intermediate export goes (deleted after a successful import)
         #[arg(long, default_value = "./migration")]
         data_dir: PathBuf,
+        /// Keep the intermediate export after migrating, as a backup
+        #[arg(long)]
+        keep_data: bool,
     },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Ensure terminal state is restored on panic (raw mode + alternate screen)
+    // Ensure terminal state is restored on panic (raw mode, bracketed paste, cursor)
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        ui::restore_terminal();
         original_hook(info);
     }));
 
     let cli = Cli::parse();
 
-    let command = match cli.command {
-        Some(cmd) => cmd,
-        None => select_command()?,
+    // With no subcommand, the menu runs inside the view the chosen command then reuses
+    let (command, mut menu_view) = match cli.command {
+        Some(cmd) => (cmd, None),
+        None => {
+            let ui = Session::start("crunchyroll-migrate", &[]);
+            let cmd = select_command(&ui).await?;
+            (cmd, Some(ui))
+        }
+    };
+    let mut open = |operation: &str, steps: &[Stage]| match menu_view.take() {
+        Some(ui) => {
+            ui.reconfigure(operation, steps);
+            ui
+        }
+        None => Session::start(operation, steps),
     };
 
     match command {
-        Command::Status {
-            email,
-            password,
-            profile,
-        } => {
-            let session = auth::initial_login(email, password, "").await?;
-            let is_premium = session.crunchy.premium().await;
-
-            println!("Account");
-            println!("  Premium: {}", if is_premium { "yes" } else { "no" });
-            println!("  Profiles: {} found\n", session.profiles.len());
-
-            for p in &session.profiles {
-                let flags = [
-                    p.is_primary.then_some("primary"),
-                    p.is_selected.then_some("selected"),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-
-                let suffix = if flags.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", flags.join(", "))
-                };
-                println!("  - {}{}", p.profile_name, suffix);
-            }
-
-            let show_data = if profile.is_some() {
-                true
-            } else {
-                dialoguer::Confirm::new()
-                    .with_prompt("Show data counts for a profile?")
-                    .default(true)
-                    .interact()?
-            };
-
-            if show_data {
-                let selected = auth::select_profile(&session.profiles, profile)?;
-                let profile_name = selected.profile_name.clone();
-                let crunchy =
-                    auth::switch_profile(&session.refresh_token, selected, session.device).await?;
-
-                let watchlist = crunchy.watchlist(WatchlistOptions::default()).await?;
-                let mut history_count: u32 = 0;
-                let mut history = crunchy.watch_history();
-                if let Some(total) = history.total().await {
-                    history_count = total;
-                } else {
-                    while history.next().await.is_some() {
-                        history_count += 1;
-                    }
-                }
-                let crunchylists = crunchy.crunchylists().await?;
-
-                println!("\nData for '{}'", profile_name);
-                println!("  Watchlist:     {} items", watchlist.len());
-                println!("  Watch history: {} items", history_count);
-                println!("  Crunchylists:  {} lists", crunchylists.items.len());
-            }
+        Command::Status { cookie, profile } => {
+            status(
+                open("Status", &[Stage::SignIn, Stage::Read]),
+                cookie,
+                profile,
+            )
+            .await?
         }
         Command::Export {
-            email,
-            password,
+            cookie,
             profile,
             output_dir,
         } => {
-            let crunchy = auth::login(email, password, profile, "", false).await?;
-            export::run(&crunchy, &output_dir).await?;
+            let ui = open("Export", &[Stage::SignIn, Stage::Read]);
+            ui.stage(Stage::SignIn);
+            let src = auth::login(&ui, cookie, profile, "", false).await?;
+            ui.route(&src.profile_name);
+            export::run(&src.crunchy, &src.profile_name, &output_dir, &ui).await?;
+            ui.finish();
+            println!("Saved to {}", display_path(&output_dir));
         }
         Command::Import {
-            email,
-            password,
+            cookie,
             profile,
             input_dir,
             dry_run,
         } => {
-            let crunchy = auth::login(email, password, profile, "", true).await?;
-            import::run(&crunchy, &input_dir, dry_run).await?;
+            let exports = import::Exports::load(&input_dir)?;
+            let steps: &[Stage] = if dry_run {
+                &[Stage::SignIn, Stage::Read, Stage::Compare]
+            } else {
+                &[Stage::SignIn, Stage::Read, Stage::Compare, Stage::Copy]
+            };
+            let ui = open(
+                if dry_run {
+                    "Import (dry run)"
+                } else {
+                    "Import"
+                },
+                steps,
+            );
+            ui.stage(Stage::SignIn);
+            let dst = auth::login(&ui, cookie, profile, "", true).await?;
+            ui.route(&format!(
+                "{} → {}",
+                exports.watchlist.metadata.profile_name, dst.profile_name
+            ));
+            exports.report_source(&ui);
+            let target = import::compare(&dst.crunchy, &exports, &ui).await?;
+            if !dry_run {
+                import::copy(&dst.crunchy, &exports, &target, &ui).await?;
+            }
+            ui.finish();
         }
         Command::Diff {
-            email,
-            password,
+            cookie,
             profile,
             input_dir,
         } => {
-            let crunchy = auth::login(email, password, profile, "", true).await?;
-            diff::run(&crunchy, &input_dir).await?;
+            let exports = import::Exports::load(&input_dir)?;
+            let ui = open("Diff", &[Stage::SignIn, Stage::Read, Stage::Compare]);
+            ui.stage(Stage::SignIn);
+            let dst = auth::login(&ui, cookie, profile, "", true).await?;
+            ui.route(&format!(
+                "{} → {}",
+                exports.watchlist.metadata.profile_name, dst.profile_name
+            ));
+            exports.report_source(&ui);
+            import::compare(&dst.crunchy, &exports, &ui).await?;
+            ui.finish();
         }
         Command::RenameProfile {
-            email,
-            password,
+            cookie,
             profile,
             new_name,
         } => {
-            let session = auth::initial_login(email, password, "").await?;
-            let mut target = auth::select_profile(&session.profiles, profile)?.clone();
-            let new_name = new_name.unwrap_or_else(|| {
-                dialoguer::Input::new()
-                    .with_prompt("New profile name")
-                    .interact_text()
-                    .expect("Failed to read new name")
-            });
+            let ui = open("Rename profile", &[Stage::SignIn]);
+            ui.stage(Stage::SignIn);
+            let session = auth::initial_login(&ui, cookie, "").await?;
+            let mut target = auth::select_profile(&ui, &session.profiles, profile, false)
+                .await?
+                .clone();
+            let new_name = match new_name {
+                Some(n) => n,
+                None => ui.text("New profile name").await?,
+            };
+            let old_name = target.profile_name.clone();
             target.change_profile_name(new_name.clone()).await?;
-            println!("Renamed to '{}'", new_name);
+            ui.route(&format!("{old_name} → {new_name}"));
+            ui.finish();
         }
         Command::Migrate {
-            source_email,
-            source_password,
+            source_cookie,
             source_profile,
-            target_email,
-            target_password,
+            target_cookie,
             target_profile,
             data_dir,
+            keep_data,
         } => {
-            println!("=== Step 1: Export from source ===\n");
-            let source = auth::login(
-                source_email,
-                source_password,
+            migrate(
+                open(
+                    "Migrate",
+                    &[
+                        Stage::Source,
+                        Stage::Read,
+                        Stage::Target,
+                        Stage::Compare,
+                        Stage::Copy,
+                    ],
+                ),
+                source_cookie,
                 source_profile,
-                "Source",
-                false,
-            )
-            .await?;
-            export::run(&source, &data_dir).await?;
-            drop(source);
-
-            println!("\n=== Step 2: Login to target ===\n");
-            let target = auth::login(
-                target_email,
-                target_password,
+                target_cookie,
                 target_profile,
-                "Target",
-                true,
+                &data_dir,
+                keep_data,
             )
             .await?;
-
-            println!("=== Step 3: Diff ===");
-            diff::run(&target, &data_dir).await?;
-
-            let proceed = dialoguer::Confirm::new()
-                .with_prompt("Proceed with import?")
-                .default(true)
-                .interact()?;
-
-            if !proceed {
-                println!("Aborted.");
-                return Ok(());
-            }
-
-            println!("\n=== Step 4: Import ===\n");
-            import::run(&target, &data_dir, false).await?;
-
-            println!("\nMigration complete.");
         }
     }
 
     Ok(())
 }
 
-fn select_command() -> anyhow::Result<Command> {
-    let items = [
-        "Migrate      Full flow: export -> diff -> confirm -> import",
-        "Status       Show account info, profiles, and data counts",
-        "Export       Export one profile's data to JSON files",
-        "Import       Import from JSON files into a profile",
-        "Diff         Compare exported data against target account",
-        "Rename       Rename a profile on the account",
-    ];
+fn display_path(p: &Path) -> String {
+    std::fs::canonicalize(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .display()
+        .to_string()
+}
 
-    let idx = dialoguer::Select::new()
-        .with_prompt("What would you like to do?")
-        .items(&items)
-        .default(0)
-        .interact()
-        .context("Selection cancelled")?;
+async fn migrate(
+    ui: Session,
+    source_cookie: Option<String>,
+    source_profile: Option<String>,
+    target_cookie: Option<String>,
+    target_profile: Option<String>,
+    data_dir: &Path,
+    keep_data: bool,
+) -> anyhow::Result<()> {
+    ui.stage(Stage::Source);
+    let source_cookie = auth::resolve_cookie(&ui, source_cookie, "Source").await?;
+    let src = auth::login(
+        &ui,
+        Some(source_cookie.clone()),
+        source_profile,
+        "Source",
+        false,
+    )
+    .await?;
+    ui.route(&src.profile_name);
+    let source_profile_id = src.crunchy.profile_id().await;
+    export::run(&src.crunchy, &src.profile_name, data_dir, &ui).await?;
+    drop(src.crunchy);
+
+    ui.stage(Stage::Target);
+    let target_cookie = match target_cookie {
+        Some(c) => Some(c),
+        None => auth::prompt_target_cookie(&ui).await?,
+    };
+    let same_account = target_cookie.is_none();
+    let target_cookie = target_cookie.unwrap_or(source_cookie);
+    let dst = auth::login(&ui, Some(target_cookie), target_profile, "Target", true).await?;
+    if same_account && dst.crunchy.profile_id().await == source_profile_id {
+        anyhow::bail!("Source and target are the same profile; nothing to migrate");
+    }
+    ui.route(&format!("{} → {}", src.profile_name, dst.profile_name));
+
+    let exports = import::Exports::load(data_dir)?;
+    let target = import::compare(&dst.crunchy, &exports, &ui).await?;
+
+    let to_copy = ui.total_to_copy();
+    if to_copy == 0 {
+        ui.note(&format!("'{}' already has everything", dst.profile_name));
+    } else if ui
+        .confirm(&format!(
+            "Copy {to_copy} items into '{}'?",
+            dst.profile_name
+        ))
+        .await?
+    {
+        import::copy(&dst.crunchy, &exports, &target, &ui).await?;
+    } else {
+        ui.finish();
+        println!("Nothing copied.");
+        return Ok(());
+    }
+    ui.finish();
+
+    if keep_data {
+        println!("Export kept in {}", display_path(data_dir));
+    } else {
+        std::fs::remove_dir_all(data_dir)
+            .with_context(|| format!("Migrated, but failed to delete {}", data_dir.display()))?;
+    }
+    Ok(())
+}
+
+async fn status(
+    ui: Session,
+    cookie: Option<String>,
+    profile: Option<String>,
+) -> anyhow::Result<()> {
+    ui.stage(Stage::SignIn);
+    let session = auth::initial_login(&ui, cookie, "").await?;
+    let is_premium = session.crunchy.premium().await;
+    let selected = auth::select_profile(&ui, &session.profiles, profile, true).await?;
+    let src = auth::switch_profile(
+        &ui,
+        &session.refresh_token,
+        selected,
+        session.device.clone(),
+    )
+    .await?;
+    let others: Vec<&str> = session
+        .profiles
+        .iter()
+        .filter(|p| p.profile_id != selected.profile_id)
+        .map(|p| p.profile_name.as_str())
+        .collect();
+    let mut route = format!(
+        "{}  ·  {}",
+        src.profile_name,
+        if is_premium { "premium" } else { "free" }
+    );
+    if !others.is_empty() {
+        route.push_str(&format!("  ·  other profiles: {}", others.join(", ")));
+    }
+    ui.route(&route);
+
+    ui.stage(Stage::Read);
+    ui.status("Reading watchlist…");
+    let watchlist = src.crunchy.watchlist(WatchlistOptions::default()).await?;
+    ui.source_count(ui::DataType::Watchlist, watchlist.len());
+
+    ui.status("Counting watch history…");
+    let mut history = src.crunchy.watch_history();
+    history.page_size(HISTORY_PAGE_SIZE);
+    let history_count = match history.total().await {
+        Some(total) => total as usize,
+        None => {
+            // No total from the API: walk every page. Propagate errors, since a
+            // failing page is refetched forever rather than skipped.
+            let mut n = 0;
+            while let Some(entry) = history.next().await {
+                entry.context("Failed to read watch history")?;
+                n += 1;
+                if n % HISTORY_PAGE_SIZE as usize == 0 {
+                    ui.source_count(ui::DataType::History, n);
+                }
+            }
+            n
+        }
+    };
+    ui.source_count(ui::DataType::History, history_count);
+
+    ui.status("Reading crunchylists…");
+    let crunchylists = src.crunchy.crunchylists().await?;
+    let list_items: usize = crunchylists.items.iter().map(|l| l.total as usize).sum();
+    ui.source_count(ui::DataType::Crunchylists, list_items);
+    ui.finish();
+    Ok(())
+}
+
+async fn select_command(ui: &Session) -> anyhow::Result<Command> {
+    let items = [
+        ("Migrate", "Copy a profile into another profile or account"),
+        ("Status", "Show a profile's account info and data counts"),
+        ("Export", "Save a profile's data to JSON files"),
+        ("Import", "Copy JSON files into a profile"),
+        ("Diff", "Compare JSON files against a profile"),
+        ("Rename", "Rename a profile"),
+    ];
+    let idx = ui
+        .select_described(
+            "Command",
+            items
+                .iter()
+                .map(|(n, d)| ((*n).to_string(), Some((*d).to_string())))
+                .collect(),
+        )
+        .await?;
 
     Ok(match idx {
         0 => Command::Migrate {
-            source_email: None,
-            source_password: None,
+            source_cookie: None,
             source_profile: None,
-            target_email: None,
-            target_password: None,
+            target_cookie: None,
             target_profile: None,
             data_dir: PathBuf::from("./migration"),
+            keep_data: false,
         },
         1 => Command::Status {
-            email: None,
-            password: None,
+            cookie: None,
             profile: None,
         },
         2 => Command::Export {
-            email: None,
-            password: None,
+            cookie: None,
             profile: None,
             output_dir: PathBuf::from("./export"),
         },
         3 => Command::Import {
-            email: None,
-            password: None,
+            cookie: None,
             profile: None,
             input_dir: PathBuf::from("./export"),
             dry_run: false,
         },
         4 => Command::Diff {
-            email: None,
-            password: None,
+            cookie: None,
             profile: None,
             input_dir: PathBuf::from("./export"),
         },
         5 => Command::RenameProfile {
-            email: None,
-            password: None,
+            cookie: None,
             profile: None,
             new_name: None,
         },
