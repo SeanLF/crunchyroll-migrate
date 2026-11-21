@@ -1,10 +1,29 @@
 //! One coherent terminal view per command.
 //!
-//! A [`Session`] owns an inline ratatui viewport (drawn in place, left in scrollback when done):
-//! header, step tracker, a per-data-type table whose columns fill in as stages run
-//! (read -> compare -> copy), a per-show list, prompts, and key hints. Flows mutate shared
-//! state; a UI thread redraws it and answers prompts. Without a TTY the same API falls back
-//! to plain lines and dialoguer prompts.
+//! A [`Session`] owns an inline ratatui viewport, drawn in place and left in scrollback when
+//! done. Its layout never changes during a run, so nothing flashes or jumps:
+//!
+//! ```text
+//!  Migrate  Sean → dup                                              1m51s
+//!  ✓ Source  ›  ✓ Read  ›  ✓ Target  ›  ✓ Compare  ›  ● Copy
+//!
+//!  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━───   638 / 673 copied   ~4s left
+//!
+//!                     Source  Target has   To copy    Copied
+//!  Watchlist              10           0        10        10 ✓
+//!  History               663           0       663       628
+//!
+//!  Shows  31 done · 4 copying · 10 waiting
+//!  ● Classroom of the Elite                          10/41 eps
+//!  ○ Overgeared                                        0/1 ep
+//!
+//!  <prompt or current activity>
+//!  <prompt hint>
+//!  <key hints>
+//! ```
+//!
+//! Flows mutate shared state; a UI thread redraws it and answers prompts. Without a TTY the
+//! same API falls back to plain lines and dialoguer prompts.
 
 use anyhow::{Result, bail};
 use crossterm::{
@@ -30,9 +49,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-const VIEW_HEIGHT: u16 = 24;
-const COMPACT_HEIGHT: u16 = 12;
-const NAME_WIDTH: usize = 30;
+const VIEW_HEIGHT: u16 = 28;
+/// Content is capped at this width so the eye doesn't travel across a wide terminal.
+const MAX_WIDTH: u16 = 92;
+const NAME_WIDTH: usize = 52;
 const OTHER_SHOW: &str = "Other (no title)";
 
 // ---------------------------------------------------------------------------------------------
@@ -125,8 +145,10 @@ impl Tally {
 #[derive(Debug, Clone)]
 struct Show {
     name: String,
+    /// Order first seen while reading.
     order: usize,
-    touched: u64,
+    /// Order of the first item planned for copying; copy runs in roughly this order.
+    plan_order: Option<usize>,
     t: [Tally; 4],
 }
 
@@ -139,6 +161,9 @@ impl Show {
     }
     fn failed(&self) -> usize {
         self.t.iter().map(|t| t.failed).sum()
+    }
+    fn finished(&self) -> bool {
+        self.done() >= self.to_copy()
     }
 }
 
@@ -156,7 +181,8 @@ pub fn show_key(series_title: &str, title: &str) -> String {
 enum PromptKind {
     Secret,
     Text,
-    Select(Vec<String>),
+    /// Options with an optional one-line description each.
+    Select(Vec<(String, Option<String>)>),
     Confirm,
 }
 
@@ -178,7 +204,6 @@ struct Prompt {
 
 struct State {
     operation: String,
-    compact: bool,
     steps: Vec<Stage>,
     stage: Option<Stage>,
     route: String,
@@ -191,20 +216,21 @@ struct State {
     compared: bool,
     shows: Vec<Show>,
     index: HashMap<String, usize>,
-    tick: u64,
+    plan_seq: usize,
     notes: Vec<Line<'static>>,
     prompt: Option<Prompt>,
     done: bool,
     /// Ended by an error rather than `finish()`.
     stopped: bool,
     scroll: usize,
+    /// Keep the first unfinished show in view while copying, until the user scrolls.
+    follow: bool,
 }
 
 impl State {
-    fn new(operation: &str, steps: &[Stage], compact: bool) -> Self {
+    fn new(operation: &str, steps: &[Stage]) -> Self {
         Self {
             operation: operation.to_string(),
-            compact,
             steps: steps.to_vec(),
             stage: None,
             route: String::new(),
@@ -217,18 +243,17 @@ impl State {
             compared: false,
             shows: Vec::new(),
             index: HashMap::new(),
-            tick: 0,
+            plan_seq: 0,
             notes: Vec::new(),
             prompt: None,
             done: false,
             stopped: false,
             scroll: 0,
+            follow: true,
         }
     }
 
     fn show_mut(&mut self, name: &str) -> &mut Show {
-        self.tick += 1;
-        let tick = self.tick;
         let idx = match self.index.get(name) {
             Some(&i) => i,
             None => {
@@ -236,16 +261,14 @@ impl State {
                 self.shows.push(Show {
                     name: name.to_string(),
                     order: i,
-                    touched: 0,
+                    plan_order: None,
                     t: [Tally::default(); 4],
                 });
                 self.index.insert(name.to_string(), i);
                 i
             }
         };
-        let show = &mut self.shows[idx];
-        show.touched = tick;
-        show
+        &mut self.shows[idx]
     }
 
     fn copying(&self) -> bool {
@@ -267,7 +290,7 @@ impl State {
     fn eta(&self) -> Option<Duration> {
         let start = self.copy_started?;
         let (done, total) = (self.total_done(), self.total_to_copy());
-        if done == 0 || done >= total {
+        if done == 0 || done >= total || self.done {
             return None;
         }
         let rate = done as f64 / start.elapsed().as_secs_f64();
@@ -286,19 +309,9 @@ pub struct Session {
 }
 
 impl Session {
-    /// Full view: header, steps, table, show list.
     pub fn start(operation: &str, steps: &[Stage]) -> Self {
-        Self::launch(operation, steps, false)
-    }
-
-    /// Prompts only (status, rename): the view is cleared when finished.
-    pub fn prompts_only(operation: &str) -> Self {
-        Self::launch(operation, &[Stage::SignIn], true)
-    }
-
-    fn launch(operation: &str, steps: &[Stage], compact: bool) -> Self {
         let tty = io::stdout().is_terminal() && io::stdin().is_terminal();
-        let state = Arc::new(Mutex::new(State::new(operation, steps, compact)));
+        let state = Arc::new(Mutex::new(State::new(operation, steps)));
         let thread = if tty {
             let s = state.clone();
             Some(std::thread::spawn(move || {
@@ -317,6 +330,14 @@ impl Session {
         }
     }
 
+    /// Reuse this view for a command chosen inside it (the opening menu).
+    pub fn reconfigure(&self, operation: &str, steps: &[Stage]) {
+        let mut s = self.lock();
+        s.operation = operation.to_string();
+        s.steps = steps.to_vec();
+        s.started = Instant::now();
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
@@ -329,6 +350,8 @@ impl Session {
         s.status.clear();
         if stage == Stage::Copy && s.copy_started.is_none() {
             s.copy_started = Some(Instant::now());
+            s.scroll = 0;
+            s.follow = true;
         }
         if stage == Stage::Read {
             s.read = true;
@@ -338,7 +361,7 @@ impl Session {
         }
     }
 
-    /// Short activity text shown next to the elapsed time ("Signing in…").
+    /// Current activity, shown in the bottom strip ("Reading watch history…").
     pub fn status(&self, text: &str) {
         self.lock().status = text.to_string();
         if !self.tty && !text.is_empty() {
@@ -346,7 +369,7 @@ impl Session {
         }
     }
 
-    /// "Sean" or "Sean -> Sean copy".
+    /// "Sean" or "Sean → Sean copy".
     pub fn route(&self, route: &str) {
         self.lock().route = route.to_string();
     }
@@ -354,14 +377,14 @@ impl Session {
     /// A permanent line above the view (kept in scrollback).
     pub fn note(&self, text: &str) {
         self.push_note(Line::from(vec![
-            Span::styled("  ✓ ", Style::new().green()),
+            Span::styled(" ✓ ", Style::new().fg(Color::Green)),
             Span::raw(text.to_string()),
         ]));
     }
 
     pub fn warn(&self, text: &str) {
         self.push_note(Line::from(vec![
-            Span::styled("  ✗ ", Style::new().red()),
+            Span::styled(" ✗ ", Style::new().fg(Color::Red)),
             Span::raw(text.to_string()),
         ]));
     }
@@ -382,17 +405,29 @@ impl Session {
         s.show_mut(show).t[kind.idx()].source += 1;
     }
 
+    /// Set a source count directly, without per-show detail (status).
+    pub fn source_count(&self, kind: DataType, n: usize) {
+        let mut s = self.lock();
+        s.read = true;
+        s.kinds[kind.idx()].source = n;
+    }
+
     /// Compare result for one source item.
     pub fn planned(&self, kind: DataType, show: &str, already: bool) {
         let mut s = self.lock();
         s.compared = true;
         let k = kind.idx();
+        let seq = s.plan_seq;
         let show = s.show_mut(show);
         if already {
             show.t[k].already += 1;
         } else {
             show.t[k].to_copy += 1;
+            if show.plan_order.is_none() {
+                show.plan_order = Some(seq);
+            }
         }
+        s.plan_seq += 1;
         if already {
             s.kinds[k].already += 1;
         } else {
@@ -448,10 +483,27 @@ impl Session {
     }
 
     pub async fn select(&self, label: &str, items: Vec<String>) -> Result<usize> {
+        self.select_described(label, items.into_iter().map(|i| (i, None)).collect())
+            .await
+    }
+
+    /// Like [`Session::select`], with a description shown under the highlighted option.
+    pub async fn select_described(
+        &self,
+        label: &str,
+        items: Vec<(String, Option<String>)>,
+    ) -> Result<usize> {
         if !self.tty {
+            let lines: Vec<String> = items
+                .iter()
+                .map(|(name, desc)| match desc {
+                    Some(d) => format!("{name:<10} {d}"),
+                    None => name.clone(),
+                })
+                .collect();
             return Ok(dialoguer::Select::new()
                 .with_prompt(label)
-                .items(&items)
+                .items(&lines)
                 .default(0)
                 .interact()?);
         }
@@ -489,8 +541,8 @@ impl Session {
 
     // --- end ---------------------------------------------------------------------------------
 
-    /// Final redraw, restore the terminal, and leave the view in scrollback
-    /// (or clear it, for prompt-only sessions). Plain mode prints the summary table.
+    /// Final redraw, restore the terminal, and leave the view in scrollback.
+    /// Plain mode prints the summary table.
     pub fn finish(&self) {
         {
             let mut s = self.lock();
@@ -500,12 +552,13 @@ impl Session {
             s.done = true;
             s.finished_in = Some(s.started.elapsed());
             s.prompt = None;
+            s.status.clear();
         }
         if let Some(t) = self.thread.lock().ok().and_then(|mut t| t.take()) {
             let _ = t.join();
         } else if !self.tty {
             let s = self.lock();
-            if !s.compact && !s.stopped && s.read {
+            if !s.stopped && s.read {
                 println!();
                 for line in table_lines(&s) {
                     println!("{line}");
@@ -545,9 +598,8 @@ fn run_view(state: &Arc<Mutex<State>>) -> io::Result<()> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
-    let compact = lock().compact;
     let (_, rows) = crossterm::terminal::size()?;
-    let height = if compact { COMPACT_HEIGHT } else { VIEW_HEIGHT }.min(rows.max(6));
+    let height = VIEW_HEIGHT.min(rows.max(8));
 
     enable_raw_mode()?;
     execute!(io::stdout(), EnableBracketedPaste)?;
@@ -580,7 +632,9 @@ fn run_view(state: &Arc<Mutex<State>>) -> io::Result<()> {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if handle_key(&mut s, key) {
                         drop(s);
+                        let area = terminal.get_frame().area();
                         terminal.clear()?;
+                        terminal.set_cursor_position(Position::new(0, area.y))?;
                         restore_terminal();
                         eprintln!("Interrupted.");
                         std::process::exit(130);
@@ -599,22 +653,15 @@ fn run_view(state: &Arc<Mutex<State>>) -> io::Result<()> {
         }
     };
 
+    // Leave the finished view in scrollback without the unused rows below it
     let area = terminal.get_frame().area();
-    if compact {
-        terminal.clear()?;
-        terminal.set_cursor_position(Position::new(0, area.y))?;
-    } else {
-        // Leave the finished view in scrollback without the unused rows below it
-        terminal.set_cursor_position(Position::new(0, area.y + used_rows))?;
-        execute!(
-            io::stdout(),
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
-        )?;
-    }
+    terminal.set_cursor_position(Position::new(0, area.y + used_rows))?;
+    execute!(
+        io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
+    )?;
     restore_terminal();
-    if !compact {
-        println!();
-    }
+    println!();
     Ok(())
 }
 
@@ -630,6 +677,7 @@ fn handle_key(s: &mut State, key: KeyEvent) -> bool {
         return true;
     }
     let Some(p) = s.prompt.as_mut() else {
+        let before = s.scroll;
         match key.code {
             KeyCode::Char('q') => return true,
             KeyCode::Up | KeyCode::Char('k') => s.scroll = s.scroll.saturating_sub(1),
@@ -637,8 +685,14 @@ fn handle_key(s: &mut State, key: KeyEvent) -> bool {
             KeyCode::PageUp => s.scroll = s.scroll.saturating_sub(10),
             KeyCode::PageDown => s.scroll += 10,
             KeyCode::Home => s.scroll = 0,
-            KeyCode::End => s.scroll = usize::MAX,
-            _ => {}
+            KeyCode::End => {
+                s.follow = true;
+                return false;
+            }
+            _ => return false,
+        }
+        if s.scroll != before || matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            s.follow = false;
         }
         return false;
     };
@@ -659,11 +713,17 @@ fn handle_key(s: &mut State, key: KeyEvent) -> bool {
             p.input.push(c);
             None
         }
-        (PromptKind::Select(items), KeyCode::Up | KeyCode::Char('k')) => {
+        (
+            PromptKind::Select(items),
+            KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k'),
+        ) => {
             p.selected = p.selected.checked_sub(1).unwrap_or(items.len() - 1);
             None
         }
-        (PromptKind::Select(items), KeyCode::Down | KeyCode::Char('j')) => {
+        (
+            PromptKind::Select(items),
+            KeyCode::Right | KeyCode::Down | KeyCode::Tab | KeyCode::Char('l') | KeyCode::Char('j'),
+        ) => {
             p.selected = (p.selected + 1) % items.len();
             None
         }
@@ -689,77 +749,90 @@ fn handle_key(s: &mut State, key: KeyEvent) -> bool {
 fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
 }
-
-fn mmss(d: Duration) -> String {
-    format!("{}m{:02}s", d.as_secs() / 60, d.as_secs() % 60)
+fn green() -> Style {
+    Style::new().fg(Color::Green)
+}
+fn cyan() -> Style {
+    Style::new().fg(Color::Cyan)
+}
+fn red() -> Style {
+    Style::new().fg(Color::Red)
+}
+fn bold() -> Style {
+    Style::new().add_modifier(Modifier::BOLD)
 }
 
+fn mmss(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Fixed layout for the whole run; only the contents of each region change.
 fn draw(f: &mut Frame, s: &mut State) {
-    let area = f.area();
-    let [header, steps, _, body, footer] = Layout::vertical([
+    let full = f.area();
+    let area = Rect {
+        width: full.width.min(MAX_WIDTH),
+        ..full
+    };
+    let has_table = s.has_step(Stage::Read);
+    let has_progress = s.has_step(Stage::Copy);
+
+    let [header, steps, _, progress, table, shows, strip] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(u16::from(!s.steps.is_empty())),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(if has_progress { 2 } else { 0 }),
+        Constraint::Length(if has_table { 6 } else { 0 }),
         Constraint::Fill(1),
-        Constraint::Length(1),
+        Constraint::Length(3),
     ])
     .areas(area);
 
     draw_header(f, s, header);
     f.render_widget(Paragraph::new(steps_line(s)), steps);
-
-    if s.prompt.is_some() {
-        draw_prompt(f, s, body);
-    } else if !s.compact {
-        let table = table_lines(s);
-        let [table_area, _, shows_area] = Layout::vertical([
-            Constraint::Length(table.len() as u16),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .areas(body);
-        f.render_widget(Paragraph::new(table), table_area);
-        draw_shows(f, s, shows_area);
+    if has_progress {
+        f.render_widget(Paragraph::new(progress_line(s, progress.width)), progress);
     }
-
-    f.render_widget(Paragraph::new(footer_line(s)).style(dim()), footer);
+    if has_table {
+        f.render_widget(Paragraph::new(table_lines(s)), table);
+    }
+    draw_shows(f, s, shows);
+    f.render_widget(Paragraph::new(strip_lines(s, strip.width)), strip);
 }
 
 fn draw_header(f: &mut Frame, s: &State, area: Rect) {
     let mut left = vec![Span::styled(
-        format!(" {} ", s.operation),
-        Style::new().cyan().add_modifier(Modifier::BOLD),
+        format!(" {}", s.operation),
+        cyan().add_modifier(Modifier::BOLD),
     )];
     if !s.route.is_empty() {
-        left.push(Span::raw(s.route.clone()));
+        left.push(Span::raw(format!("   {}", s.route)));
     }
 
-    let elapsed = s.finished_in.unwrap_or_else(|| s.started.elapsed());
+    let elapsed = mmss(s.finished_in.unwrap_or_else(|| s.started.elapsed()));
     let right = if s.stopped {
         Line::from(vec![
-            Span::styled("✗ Stopped ", Style::new().red().bold()),
-            Span::styled(mmss(elapsed), dim()),
-            Span::raw(" "),
+            Span::styled("✗ Stopped  ", red().add_modifier(Modifier::BOLD)),
+            Span::styled(elapsed, dim()),
         ])
     } else if s.done {
         Line::from(vec![
-            Span::styled("✓ Done ", Style::new().green().bold()),
-            Span::styled(mmss(elapsed), dim()),
-            Span::raw(" "),
+            Span::styled("✓ Done  ", green().add_modifier(Modifier::BOLD)),
+            Span::styled(elapsed, dim()),
         ])
     } else {
-        let mut parts = vec![];
-        if !s.status.is_empty() {
-            parts.push(Span::raw(format!("{}  ", s.status)));
-        }
-        if let Some(eta) = s.eta() {
-            parts.push(Span::raw(format!("~{} left  ", mmss(eta))));
-        }
-        parts.push(Span::styled(format!("{} ", mmss(elapsed)), dim()));
-        Line::from(parts)
+        Line::styled(elapsed, dim())
     };
 
-    let [l, r] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(40)]).areas(area);
+    let [l, r] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(20)]).areas(area);
     f.render_widget(Paragraph::new(Line::from(left)), l);
     f.render_widget(Paragraph::new(right).right_aligned(), r);
 }
@@ -772,12 +845,16 @@ fn steps_line(s: &State) -> Line<'static> {
             spans.push(Span::styled("  ›  ", dim()));
         }
         let (text, style) = match current {
-            Some(c) if s.stopped && i == c => {
-                (format!("✗ {}", step.label()), Style::new().red().bold())
-            }
-            _ if s.done && !s.stopped => (format!("✓ {}", step.label()), Style::new().green()),
-            Some(c) if i < c => (format!("✓ {}", step.label()), Style::new().green()),
-            Some(c) if i == c => (format!("● {}", step.label()), Style::new().cyan().bold()),
+            Some(c) if s.stopped && i == c => (
+                format!("✗ {}", step.label()),
+                red().add_modifier(Modifier::BOLD),
+            ),
+            _ if s.done && !s.stopped => (format!("✓ {}", step.label()), green()),
+            Some(c) if i < c => (format!("✓ {}", step.label()), green()),
+            Some(c) if i == c => (
+                format!("● {}", step.label()),
+                cyan().add_modifier(Modifier::BOLD),
+            ),
             _ => (step.label().to_string(), dim()),
         };
         spans.push(Span::styled(text, style));
@@ -785,14 +862,64 @@ fn steps_line(s: &State) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Data-type table. Columns appear for the stages this command runs.
+fn bar(ratio: f64, width: usize) -> Vec<Span<'static>> {
+    let filled = ((ratio.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    vec![
+        Span::styled("━".repeat(filled), green()),
+        Span::styled("─".repeat(width - filled), dim()),
+    ]
+}
+
+/// One overall bar for the copy, with totals and ETA beside it.
+fn progress_line(s: &State, width: u16) -> Vec<Line<'static>> {
+    let (done, total) = (s.total_done(), s.total_to_copy());
+    let failed: usize = s.kinds.iter().map(|t| t.failed).sum();
+
+    let mut tail = vec![];
+    if !s.copying() {
+        tail.push(Span::styled(
+            if s.compared {
+                format!("{} to copy", plural(total, "item", "items"))
+            } else {
+                "nothing copied yet".to_string()
+            },
+            dim(),
+        ));
+    } else {
+        tail.push(Span::styled(format!("{done} / {total}"), bold()));
+        tail.push(Span::styled(" copied", dim()));
+        if failed > 0 {
+            tail.push(Span::styled(format!("   {failed} failed"), red()));
+        }
+        if let Some(eta) = s.eta() {
+            tail.push(Span::styled(format!("   ~{} left", mmss(eta)), dim()));
+        }
+    }
+
+    let tail_width: usize = tail.iter().map(|sp| sp.content.chars().count()).sum();
+    let bar_width = (width as usize)
+        .saturating_sub(tail_width + 5)
+        .clamp(10, 48);
+    let ratio = if total == 0 {
+        if s.done && s.copying() { 1.0 } else { 0.0 }
+    } else {
+        done as f64 / total as f64
+    };
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(bar(ratio, bar_width));
+    spans.push(Span::raw("   "));
+    spans.extend(tail);
+    vec![Line::from(spans), Line::raw("")]
+}
+
+/// Data-type table. Columns appear for the stages this command runs; unknown cells are dim dots.
 fn table_lines(s: &State) -> Vec<Line<'static>> {
     let compare = s.has_step(Stage::Compare);
     let copy = s.has_step(Stage::Copy);
 
-    let mut head = format!(" {:<14}{:>10}", "", "On source");
+    let mut head = format!(" {:<16}{:>10}", "", "Source");
     if compare {
-        head.push_str(&format!("{:>16}{:>10}", "Already there", "To copy"));
+        head.push_str(&format!("{:>12}{:>10}", "Target has", "To copy"));
     }
     if copy {
         head.push_str(&format!("{:>10}", "Copied"));
@@ -801,103 +928,108 @@ fn table_lines(s: &State) -> Vec<Line<'static>> {
 
     for kind in DataType::ALL {
         let t = s.kinds[kind.idx()];
-        let cell = |known: bool, n: usize, w: usize| {
-            if known {
-                format!("{n:>w$}")
+        let empty = s.read && t.source == 0;
+        let cell = |known: bool, n: usize, w: usize| -> Span<'static> {
+            if !known {
+                Span::styled(format!("{:>w$}", "·"), dim())
+            } else if n == 0 {
+                Span::styled(format!("{:>w$}", "–"), dim())
             } else {
-                format!("{:>w$}", "·")
+                Span::raw(format!("{n:>w$}"))
             }
         };
-        let empty = s.read && t.source == 0;
-        let mut spans = vec![Span::raw(format!(" {:<14}", kind.label()))];
-        spans.push(Span::raw(cell(s.read, t.source, 10)));
+        let label_style = if empty { dim() } else { Style::new() };
+        let mut spans = vec![
+            Span::styled(format!(" {:<16}", kind.label()), label_style),
+            cell(s.read, t.source, 10),
+        ];
         if compare {
-            spans.push(Span::raw(cell(s.compared, t.already, 16)));
-            spans.push(Span::raw(cell(s.compared, t.to_copy, 10)));
+            spans.push(cell(s.compared, t.already, 12));
+            spans.push(cell(s.compared, t.to_copy, 10));
         }
         if copy {
-            spans.push(Span::raw(cell(s.copying(), t.copied, 10)));
-            if s.copying() && t.to_copy > 0 {
-                let ratio = t.done() as f64 / t.to_copy as f64;
-                spans.push(Span::raw("  "));
-                spans.extend(bar(ratio, 16));
-                if t.done() >= t.to_copy && t.failed == 0 {
-                    spans.push(Span::styled(" ✓", Style::new().green()));
-                }
+            spans.push(cell(s.copying(), t.copied, 10));
+            if s.copying() && t.to_copy > 0 && t.done() >= t.to_copy && t.failed == 0 {
+                spans.push(Span::styled(" ✓", green()));
             }
             if t.failed > 0 {
-                spans.push(Span::styled(
-                    format!("  {} failed", t.failed),
-                    Style::new().red(),
-                ));
+                spans.push(Span::styled(format!("  {} failed", t.failed), red()));
             }
         }
-        let mut line = Line::from(spans);
-        if empty {
-            line = line.style(dim());
-        }
-        lines.push(line);
+        lines.push(Line::from(spans));
     }
+    lines.push(Line::raw(""));
     lines
 }
 
-fn bar(ratio: f64, width: usize) -> Vec<Span<'static>> {
-    let filled = ((ratio.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-    vec![
-        Span::styled("━".repeat(filled), Style::new().green()),
-        Span::styled("─".repeat(width - filled), dim()),
-    ]
-}
-
-/// Order: in progress, then queued, then finished, then nothing to do. Stable within groups.
+/// Stable order: read order, then (from compare on) the order copy will reach each show.
+/// Rows never move while items arrive.
 fn show_order(s: &State) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..s.shows.len()).collect();
-    if s.copying() {
-        let rank = |sh: &Show| {
-            let (to, done) = (sh.to_copy(), sh.done());
-            if to == 0 {
-                3
-            } else if done >= to {
-                2
-            } else if done > 0 {
-                0
-            } else {
-                1
-            }
-        };
+    if s.compared {
         idx.sort_by_key(|&i| {
             let sh = &s.shows[i];
-            let r = rank(sh);
-            (r, if r == 0 { u64::MAX - sh.touched } else { 0 }, sh.order)
+            (sh.plan_order.is_none(), sh.plan_order, sh.order)
         });
-    } else if s.compared {
-        idx.sort_by_key(|&i| (s.shows[i].to_copy() == 0, s.shows[i].order));
     }
     idx
 }
 
+fn shows_header(s: &State) -> Line<'static> {
+    let n = s.shows.len();
+    let mut spans = vec![Span::styled(" Shows", bold())];
+    let detail = if s.copying() {
+        let with_work: Vec<&Show> = s.shows.iter().filter(|sh| sh.to_copy() > 0).collect();
+        let done = with_work.iter().filter(|sh| sh.finished()).count();
+        let active = with_work
+            .iter()
+            .filter(|sh| !sh.finished() && sh.done() > 0)
+            .count();
+        let waiting = with_work.len() - done - active;
+        format!("   {done} done · {active} copying · {waiting} waiting")
+    } else if s.compared {
+        let need = s.shows.iter().filter(|sh| sh.to_copy() > 0).count();
+        format!("   {} · {need} need copying", plural(n, "show", "shows"))
+    } else {
+        format!("   {}", plural(n, "show", "shows"))
+    };
+    spans.push(Span::styled(detail, dim()));
+    Line::from(spans)
+}
+
 fn draw_shows(f: &mut Frame, s: &mut State, area: Rect) {
-    if s.shows.is_empty() || area.height == 0 {
+    if s.shows.is_empty() || area.height < 2 {
         return;
     }
     let order = show_order(s);
-    let rows = area.height as usize;
+    let rows = area.height as usize - 1; // header line
     let needs_more = order.len() > rows;
     let visible = if needs_more { rows - 1 } else { rows };
     let max_scroll = order.len().saturating_sub(visible);
+
+    if s.copying() && s.follow {
+        // Keep the first unfinished show at the top: finished shows scroll away like a log
+        let first_open = order
+            .iter()
+            .position(|&i| !s.shows[i].finished())
+            .unwrap_or(order.len());
+        s.scroll = first_open;
+    }
     s.scroll = s.scroll.min(max_scroll);
 
-    let mut lines: Vec<Line> = order[s.scroll..]
-        .iter()
-        .take(visible)
-        .map(|&i| show_line(s, &s.shows[i]))
-        .collect();
+    let mut lines = vec![shows_header(s)];
+    lines.extend(
+        order[s.scroll..]
+            .iter()
+            .take(visible)
+            .map(|&i| show_line(s, &s.shows[i])),
+    );
     if needs_more {
         let below = order.len() - s.scroll - visible;
         let text = match (s.scroll, below) {
-            (0, b) => format!("   … {b} more shows  (↑↓ to scroll)"),
-            (a, 0) => format!("   … {a} above"),
-            (a, b) => format!("   … {a} above, {b} below"),
+            (0, b) => format!("   + {b} more"),
+            (a, 0) => format!("   {a} above"),
+            (a, b) => format!("   {a} above · {b} more"),
         };
         lines.push(Line::styled(text, dim()));
     }
@@ -906,16 +1038,17 @@ fn draw_shows(f: &mut Frame, s: &mut State, area: Rect) {
 
 fn show_line(s: &State, sh: &Show) -> Line<'static> {
     let (to, done, failed) = (sh.to_copy(), sh.done(), sh.failed());
-    let (marker, mstyle) = if failed > 0 {
-        ("✗", Style::new().red())
-    } else if s.copying() && to > 0 && done >= to {
-        ("✓", Style::new().green())
+    let nothing_to_do = s.compared && to == 0;
+    let (marker, mstyle, name_style) = if failed > 0 {
+        ("✗", red(), Style::new())
+    } else if nothing_to_do {
+        ("✓", dim(), dim())
+    } else if s.copying() && done >= to {
+        ("✓", green(), Style::new())
     } else if s.copying() && done > 0 {
-        ("●", Style::new().cyan())
-    } else if s.compared && to == 0 {
-        ("✓", dim())
+        ("●", cyan(), Style::new())
     } else {
-        ("○", dim())
+        ("○", dim(), Style::new())
     };
 
     let mut name: String = sh.name.chars().take(NAME_WIDTH).collect();
@@ -923,36 +1056,9 @@ fn show_line(s: &State, sh: &Show) -> Line<'static> {
         name.pop();
         name.push('…');
     }
-    let name_style = if s.compared && to == 0 {
-        dim()
-    } else {
-        Style::new()
-    };
-    let mut spans = vec![
-        Span::styled(format!(" {marker} "), mstyle),
-        Span::styled(format!("{name:<NAME_WIDTH$}  "), name_style),
-    ];
-
-    let tag_style = |t: &Tally| {
-        if t.failed > 0 {
-            Style::new().red()
-        } else if t.to_copy > 0 && t.done() >= t.to_copy {
-            Style::new().green()
-        } else if s.compared && t.to_copy == 0 {
-            dim()
-        } else {
-            Style::new()
-        }
-    };
-
-    let w = sh.t[DataType::Watchlist.idx()];
-    spans.push(Span::styled(
-        format!("{:<13}", if w.source > 0 { "★ watchlist" } else { "" }),
-        tag_style(&w),
-    ));
 
     let h = sh.t[DataType::History.idx()];
-    let eps = |n: usize| if n == 1 { "ep" } else { "eps" };
+    let eps = |n: usize| if n == 1 { "ep " } else { "eps" };
     let history = if h.source == 0 {
         String::new()
     } else if s.compared && h.to_copy > 0 {
@@ -960,86 +1066,133 @@ fn show_line(s: &State, sh: &Show) -> Line<'static> {
     } else {
         format!("{} {}", h.source, eps(h.source))
     };
-    spans.push(Span::styled(format!("{history:<13}"), tag_style(&h)));
 
-    let r = sh.t[DataType::Ratings.idx()];
-    spans.push(Span::styled(
-        format!("{:<7}", if r.source > 0 { "rated" } else { "" }),
-        tag_style(&r),
-    ));
+    let tag = |t: Tally, text: &str| -> Span<'static> {
+        if t.source == 0 {
+            return Span::raw(" ".repeat(text.chars().count() + 2));
+        }
+        let style = if t.failed > 0 {
+            red()
+        } else if nothing_to_do || (s.compared && t.to_copy == 0) {
+            dim()
+        } else if s.copying() && t.done() >= t.to_copy {
+            green()
+        } else {
+            Style::new()
+        };
+        Span::styled(format!("  {text}"), style)
+    };
 
-    let c = sh.t[DataType::Crunchylists.idx()];
-    if c.source > 0 {
-        let lists = if c.source == 1 { "list" } else { "lists" };
-        spans.push(Span::styled(
-            format!("in {} {lists}  ", c.source),
-            tag_style(&c),
-        ));
-    }
-
-    if s.copying() && h.to_copy > 1 && h.done() < h.to_copy {
-        spans.extend(bar(h.done() as f64 / h.to_copy as f64, 12));
-    }
-    Line::from(spans)
+    Line::from(vec![
+        Span::styled(format!(" {marker} "), mstyle),
+        Span::styled(format!("{name:<NAME_WIDTH$}"), name_style),
+        Span::styled(format!("{history:>11}"), name_style),
+        tag(sh.t[DataType::Watchlist.idx()], "★"),
+        tag(sh.t[DataType::Ratings.idx()], "rated"),
+        tag(sh.t[DataType::Crunchylists.idx()], "listed"),
+    ])
 }
 
-fn draw_prompt(f: &mut Frame, s: &State, area: Rect) {
-    let Some(p) = &s.prompt else { return };
-    let mut lines = vec![Line::from(Span::styled(
-        format!(" {}", p.label),
-        Style::new().bold(),
-    ))];
-    if let Some(h) = &p.hint {
-        lines.push(Line::styled(format!(" {h}"), dim()));
-    }
-    lines.push(Line::raw(""));
+/// Bottom strip, always three rows: prompt (or current activity), hint, key hints.
+fn strip_lines(s: &State, width: u16) -> Vec<Line<'static>> {
+    let Some(p) = &s.prompt else {
+        let activity = if s.status.is_empty() {
+            Line::raw("")
+        } else {
+            Line::styled(format!(" {}", s.status), dim())
+        };
+        let keys = if s.done {
+            ""
+        } else if s.shows.len() > 1 {
+            " ↑↓ scroll · end follow · q quit"
+        } else {
+            " q quit"
+        };
+        return vec![activity, Line::raw(""), Line::styled(keys, dim())];
+    };
 
-    let cursor = Span::styled("▏", Style::new().cyan());
-    match &p.kind {
+    let label = Span::styled(format!(" {}  ", p.label), bold());
+    let cursor = Span::styled("▏", cyan());
+    let (input_line, hint, keys) = match &p.kind {
         PromptKind::Secret => {
             let n = p.input.chars().count();
-            let shown = if n > 40 {
-                format!("{}  ({n} chars)", "•".repeat(40))
+            let shown = if n > 32 {
+                format!("{}  {n} chars", "•".repeat(32))
             } else {
                 "•".repeat(n)
             };
-            lines.push(Line::from(vec![
-                Span::styled(" › ", Style::new().cyan()),
-                Span::raw(shown),
-                cursor,
-            ]));
+            (
+                Line::from(vec![label, Span::raw(shown), cursor]),
+                p.hint.clone(),
+                " enter submit · esc cancel · paste works",
+            )
         }
-        PromptKind::Text => lines.push(Line::from(vec![
-            Span::styled(" › ", Style::new().cyan()),
-            Span::raw(p.input.clone()),
-            cursor,
-        ])),
+        PromptKind::Text => (
+            Line::from(vec![label, Span::raw(p.input.clone()), cursor]),
+            p.hint.clone(),
+            " enter submit · esc cancel",
+        ),
+        PromptKind::Confirm => (
+            Line::from(vec![
+                label,
+                Span::styled("enter", cyan()),
+                Span::raw(" yes   "),
+                Span::styled("esc", cyan()),
+                Span::raw(" no"),
+            ]),
+            p.hint.clone(),
+            "",
+        ),
         PromptKind::Select(items) => {
-            let room = (area.height as usize).saturating_sub(lines.len()).max(1);
-            let start = p.selected.saturating_sub(room - 1);
-            for (i, item) in items.iter().enumerate().skip(start).take(room) {
-                lines.push(if i == p.selected {
-                    Line::styled(format!(" › {item}"), Style::new().cyan().bold())
-                } else {
-                    Line::raw(format!("   {item}"))
-                });
+            let mut spans = vec![label];
+            let mut used: usize = spans[0].content.chars().count();
+            // Window of options around the selection if they don't all fit
+            let widths: Vec<usize> = items.iter().map(|(n, _)| n.chars().count() + 4).collect();
+            let room = (width as usize).saturating_sub(used + 4);
+            let mut start = 0;
+            while widths[start..=p.selected].iter().sum::<usize>() > room && start < p.selected {
+                start += 1;
             }
+            if start > 0 {
+                spans.push(Span::styled("‹ ", dim()));
+                used += 2;
+            }
+            let mut end = start;
+            for (i, (name, _)) in items.iter().enumerate().skip(start) {
+                if used + widths[i] > width as usize {
+                    break;
+                }
+                used += widths[i];
+                end = i + 1;
+                spans.push(if i == p.selected {
+                    Span::styled(
+                        format!(" {name} "),
+                        Style::new()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw(format!(" {name} "))
+                });
+                spans.push(Span::raw("  "));
+            }
+            if end < items.len() {
+                spans.push(Span::styled("›", dim()));
+            }
+            let hint = items[p.selected].1.clone().or_else(|| p.hint.clone());
+            (
+                Line::from(spans),
+                hint,
+                " ←→ choose · enter select · esc cancel",
+            )
         }
-        PromptKind::Confirm => {}
-    }
-    f.render_widget(Paragraph::new(lines), area);
-}
-
-fn footer_line(s: &State) -> Line<'static> {
-    let text = match s.prompt.as_ref().map(|p| &p.kind) {
-        Some(PromptKind::Secret | PromptKind::Text) => " enter submit · esc cancel · paste works",
-        Some(PromptKind::Select(_)) => " ↑↓ choose · enter select · esc cancel",
-        Some(PromptKind::Confirm) => " enter yes · esc no",
-        None if s.done => "",
-        None if s.compact => " ctrl+c quit",
-        None => " ↑↓ scroll shows · q quit",
     };
-    Line::raw(text)
+    vec![
+        input_line,
+        hint.map_or_else(|| Line::raw(""), |h| Line::styled(format!(" {h}"), dim())),
+        Line::styled(keys, dim()),
+    ]
 }
 
 #[cfg(test)]
@@ -1065,14 +1218,19 @@ mod tests {
 
     fn plan(s: &mut State, kind: DataType, show: &str, already: bool) {
         let k = kind.idx();
+        s.read = true;
         s.kinds[k].source += 1;
+        s.show_mut(show).t[k].source += 1;
+        s.compared = true;
+        let seq = s.plan_seq;
+        s.plan_seq += 1;
         let sh = s.show_mut(show);
-        sh.t[k].source += 1;
         if already {
             sh.t[k].already += 1;
             s.kinds[k].already += 1;
         } else {
             sh.t[k].to_copy += 1;
+            sh.plan_order.get_or_insert(seq);
             s.kinds[k].to_copy += 1;
         }
     }
@@ -1085,11 +1243,9 @@ mod tests {
             Stage::Compare,
             Stage::Copy,
         ];
-        let mut s = State::new("Migrate", &steps, false);
+        let mut s = State::new("Migrate", &steps);
         s.route = "Sean → Sean copy".into();
         s.stage = Some(Stage::Copy);
-        s.read = true;
-        s.compared = true;
         s.copy_started = Some(Instant::now());
         s
     }
@@ -1102,54 +1258,65 @@ mod tests {
     }
 
     #[test]
-    fn copy_view_renders_table_and_shows() {
+    fn copy_view_renders_progress_table_and_shows() {
         let mut s = migrate_state();
-        plan(&mut s, DataType::History, "Gachiakuta", true);
         plan(&mut s, DataType::Watchlist, "Frieren", false);
         for _ in 0..4 {
             plan(&mut s, DataType::History, "Frieren", false);
         }
+        plan(&mut s, DataType::History, "Gachiakuta", true);
         s.kinds[DataType::History.idx()].copied = 2;
         s.show_mut("Frieren").t[DataType::History.idx()].copied = 2;
 
-        let out = render(&mut s, 110, 16);
+        let out = render(&mut s, 100, 24);
         assert!(out.contains("● Copy"), "{out}");
-        assert!(out.contains("Already there"), "{out}");
+        assert!(out.contains("2 / 5 copied"), "{out}");
+        assert!(out.contains("Target has"), "{out}");
         assert!(out.contains("2/4 eps"), "{out}");
-        assert!(out.contains("★ watchlist"), "{out}");
-        // In-progress Frieren sorts above Gachiakuta, which had nothing to copy
-        assert!(
-            out.find("Frieren").unwrap() < out.find("Gachiakuta").unwrap(),
-            "{out}"
-        );
+        assert!(out.contains("1 copying"), "{out}");
     }
 
     #[test]
-    fn stopped_view_marks_failed_step() {
+    fn rows_keep_their_order_while_items_arrive() {
         let mut s = migrate_state();
-        s.stage = Some(Stage::Compare);
-        s.done = true;
-        s.stopped = true;
-        let out = render(&mut s, 110, 12);
-        assert!(out.contains("✓ Read"), "{out}");
-        assert!(out.contains("✗ Compare"), "{out}");
-        assert!(out.contains("Stopped"), "{out}");
-        assert!(!out.contains("Done"), "{out}");
+        for name in ["A", "B", "C"] {
+            plan(&mut s, DataType::History, name, false);
+            plan(&mut s, DataType::History, name, false);
+        }
+        let before = show_order(&s);
+        // Copy progress on C must not move it
+        s.show_mut("C").t[DataType::History.idx()].copied = 1;
+        assert_eq!(show_order(&s), before);
+    }
+
+    #[test]
+    fn follow_scrolls_past_finished_shows() {
+        let mut s = migrate_state();
+        for name in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"] {
+            plan(&mut s, DataType::History, name, false);
+        }
+        for name in ["A", "B", "C"] {
+            s.show_mut(name).t[DataType::History.idx()].copied = 1;
+        }
+        let out = render(&mut s, 100, 22);
+        assert!(!out.contains(" ✓ A "), "{out}");
+        assert!(out.contains("○ D"), "{out}");
+        assert!(out.contains("3 above"), "{out}");
     }
 
     #[test]
     fn export_view_hides_compare_columns() {
-        let mut s = State::new("Export", &[Stage::SignIn, Stage::Read], false);
+        let mut s = State::new("Export", &[Stage::SignIn, Stage::Read]);
         s.stage = Some(Stage::Read);
         s.read = true;
-        let out = render(&mut s, 100, 12);
-        assert!(out.contains("On source"));
+        let out = render(&mut s, 100, 16);
+        assert!(out.contains("Source"));
         assert!(!out.contains("To copy"));
     }
 
     #[test]
-    fn secret_prompt_masks_input() {
-        let mut s = State::new("Export", &[Stage::SignIn, Stage::Read], false);
+    fn prompt_lives_in_the_strip_and_keeps_the_table() {
+        let mut s = State::new("Export", &[Stage::SignIn, Stage::Read]);
         s.prompt = Some(Prompt {
             label: "etp_rt cookie".into(),
             hint: None,
@@ -1158,25 +1325,41 @@ mod tests {
             selected: 0,
             reply: None,
         });
-        let out = render(&mut s, 80, 10);
+        let out = render(&mut s, 80, 16);
         assert!(out.contains("•••••••"), "{out}");
         assert!(!out.contains("hunter2"));
+        assert!(out.contains("Watchlist"), "{out}");
+    }
+
+    #[test]
+    fn stopped_view_marks_failed_step() {
+        let mut s = migrate_state();
+        s.stage = Some(Stage::Compare);
+        s.done = true;
+        s.stopped = true;
+        let out = render(&mut s, 100, 16);
+        assert!(out.contains("✓ Read"), "{out}");
+        assert!(out.contains("✗ Compare"), "{out}");
+        assert!(out.contains("Stopped"), "{out}");
+        assert!(!out.contains("Done"), "{out}");
     }
 
     #[test]
     fn select_prompt_wraps_and_replies() {
-        let mut s = State::new("Export", &[Stage::SignIn], false);
+        let mut s = State::new("Export", &[Stage::SignIn]);
         let (tx, mut rx) = oneshot::channel();
         s.prompt = Some(Prompt {
             label: "Profile".into(),
             hint: None,
-            kind: PromptKind::Select(vec!["a".into(), "b".into()]),
+            kind: PromptKind::Select(vec![("a".into(), None), ("b".into(), Some("desc".into()))]),
             input: String::new(),
             selected: 0,
             reply: Some(tx),
         });
         let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
-        handle_key(&mut s, key(KeyCode::Up));
+        handle_key(&mut s, key(KeyCode::Left));
+        let out = render(&mut s, 80, 10);
+        assert!(out.contains("desc"), "{out}");
         handle_key(&mut s, key(KeyCode::Enter));
         assert!(matches!(rx.try_recv(), Ok(Reply::Index(1))));
         assert!(s.prompt.is_none());

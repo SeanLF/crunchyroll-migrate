@@ -4,8 +4,7 @@ use crunchyroll_rs::auth::{DeviceIdentifier, SessionToken};
 use crunchyroll_rs::profile::Profile;
 use crunchyroll_rs::{Crunchyroll, Locale};
 
-const COOKIE_HINT: &str = "Log in at crunchyroll.com, then copy the etp_rt cookie \
-                           (devtools > Application/Storage > Cookies).";
+const COOKIE_HINT: &str = "crunchyroll.com, logged in: devtools › Application › Cookies › etp_rt";
 
 pub struct InitialSession {
     pub crunchy: Crunchyroll,
@@ -79,7 +78,7 @@ pub async fn prompt_target_cookie(ui: &Session) -> Result<Option<String>> {
     let raw = ui
         .secret(
             "Target etp_rt cookie",
-            Some("Paste the target account's cookie, or press enter to copy into another profile on the source account."),
+            Some("Empty: copy into another profile on the same account"),
         )
         .await?;
     let cookie = normalize_cookie(&raw);

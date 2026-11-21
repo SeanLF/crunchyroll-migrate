@@ -126,12 +126,12 @@ crunchyroll-migrate rename-profile --profile "Old Name" --new-name "New Name"
 
 ## Terminal view
 
-Every command runs in one view drawn in place in your terminal, and stays in scrollback when it's done:
+Every command runs in one view drawn in place in your terminal, which stays in scrollback when it's done. Its layout doesn't change during a run, so nothing flashes or jumps:
 
-- A step tracker (`Source › Read › Target › Compare › Copy` for a migration)
-- A table per data type whose columns fill in as steps finish: on source, already there, to copy, copied
-- One row per show, with watchlist, episodes copied and ratings; shows being copied move to the top
-- Prompts (cookie, profile, confirm) inside the same view, with hidden cookie input and paste support
+- A step tracker (`Source › Read › Target › Compare › Copy` for a migration) and one overall progress bar with an ETA
+- A table per data type whose columns fill in as steps finish: source, target has, to copy, copied
+- One row per show, in the order they'll be copied; finished shows scroll away while copying (`↑↓` to look around, `end` to follow again)
+- Prompts (menu, cookie, profile, confirm) in a fixed strip at the bottom, with hidden cookie input and paste support
 - Failures printed above the view so they stay readable; `q` or Ctrl+C stops (exit code 130)
 
 Falls back to plain lines when stdin or stdout isn't a terminal (piped, CI).

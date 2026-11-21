@@ -112,19 +112,38 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let command = match cli.command {
-        Some(cmd) => cmd,
-        None => select_command()?,
+    // With no subcommand, the menu runs inside the view the chosen command then reuses
+    let (command, mut menu_view) = match cli.command {
+        Some(cmd) => (cmd, None),
+        None => {
+            let ui = Session::start("crunchyroll-migrate", &[]);
+            let cmd = select_command(&ui).await?;
+            (cmd, Some(ui))
+        }
+    };
+    let mut open = |operation: &str, steps: &[Stage]| match menu_view.take() {
+        Some(ui) => {
+            ui.reconfigure(operation, steps);
+            ui
+        }
+        None => Session::start(operation, steps),
     };
 
     match command {
-        Command::Status { cookie, profile } => status(cookie, profile).await?,
+        Command::Status { cookie, profile } => {
+            status(
+                open("Status", &[Stage::SignIn, Stage::Read]),
+                cookie,
+                profile,
+            )
+            .await?
+        }
         Command::Export {
             cookie,
             profile,
             output_dir,
         } => {
-            let ui = Session::start("Export", &[Stage::SignIn, Stage::Read]);
+            let ui = open("Export", &[Stage::SignIn, Stage::Read]);
             ui.stage(Stage::SignIn);
             let src = auth::login(&ui, cookie, profile, "", false).await?;
             ui.route(&src.profile_name);
@@ -144,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 &[Stage::SignIn, Stage::Read, Stage::Compare, Stage::Copy]
             };
-            let ui = Session::start(
+            let ui = open(
                 if dry_run {
                     "Import (dry run)"
                 } else {
@@ -171,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
             input_dir,
         } => {
             let exports = import::Exports::load(&input_dir)?;
-            let ui = Session::start("Diff", &[Stage::SignIn, Stage::Read, Stage::Compare]);
+            let ui = open("Diff", &[Stage::SignIn, Stage::Read, Stage::Compare]);
             ui.stage(Stage::SignIn);
             let dst = auth::login(&ui, cookie, profile, "", true).await?;
             ui.route(&format!(
@@ -187,7 +206,8 @@ async fn main() -> anyhow::Result<()> {
             profile,
             new_name,
         } => {
-            let ui = Session::prompts_only("Rename profile");
+            let ui = open("Rename profile", &[Stage::SignIn]);
+            ui.stage(Stage::SignIn);
             let session = auth::initial_login(&ui, cookie, "").await?;
             let mut target = auth::select_profile(&ui, &session.profiles, profile, false)
                 .await?
@@ -198,8 +218,8 @@ async fn main() -> anyhow::Result<()> {
             };
             let old_name = target.profile_name.clone();
             target.change_profile_name(new_name.clone()).await?;
+            ui.route(&format!("{old_name} → {new_name}"));
             ui.finish();
-            println!("Renamed '{old_name}' to '{new_name}'");
         }
         Command::Migrate {
             source_cookie,
@@ -210,6 +230,16 @@ async fn main() -> anyhow::Result<()> {
             keep_data,
         } => {
             migrate(
+                open(
+                    "Migrate",
+                    &[
+                        Stage::Source,
+                        Stage::Read,
+                        Stage::Target,
+                        Stage::Compare,
+                        Stage::Copy,
+                    ],
+                ),
                 source_cookie,
                 source_profile,
                 target_cookie,
@@ -232,6 +262,7 @@ fn display_path(p: &Path) -> String {
 }
 
 async fn migrate(
+    ui: Session,
     source_cookie: Option<String>,
     source_profile: Option<String>,
     target_cookie: Option<String>,
@@ -239,17 +270,6 @@ async fn migrate(
     data_dir: &Path,
     keep_data: bool,
 ) -> anyhow::Result<()> {
-    let ui = Session::start(
-        "Migrate",
-        &[
-            Stage::Source,
-            Stage::Read,
-            Stage::Target,
-            Stage::Compare,
-            Stage::Copy,
-        ],
-    );
-
     ui.stage(Stage::Source);
     let source_cookie = auth::resolve_cookie(&ui, source_cookie, "Source").await?;
     let src = auth::login(
@@ -308,8 +328,12 @@ async fn migrate(
     Ok(())
 }
 
-async fn status(cookie: Option<String>, profile: Option<String>) -> anyhow::Result<()> {
-    let ui = Session::prompts_only("Status");
+async fn status(
+    ui: Session,
+    cookie: Option<String>,
+    profile: Option<String>,
+) -> anyhow::Result<()> {
+    ui.stage(Stage::SignIn);
     let session = auth::initial_login(&ui, cookie, "").await?;
     let is_premium = session.crunchy.premium().await;
     let selected = auth::select_profile(&ui, &session.profiles, profile, true).await?;
@@ -320,63 +344,74 @@ async fn status(cookie: Option<String>, profile: Option<String>) -> anyhow::Resu
         session.device.clone(),
     )
     .await?;
+    let others: Vec<&str> = session
+        .profiles
+        .iter()
+        .filter(|p| p.profile_id != selected.profile_id)
+        .map(|p| p.profile_name.as_str())
+        .collect();
+    let mut route = format!(
+        "{}  ·  {}",
+        src.profile_name,
+        if is_premium { "premium" } else { "free" }
+    );
+    if !others.is_empty() {
+        route.push_str(&format!("  ·  other profiles: {}", others.join(", ")));
+    }
+    ui.route(&route);
 
+    ui.stage(Stage::Read);
     ui.status("Reading watchlist…");
     let watchlist = src.crunchy.watchlist(WatchlistOptions::default()).await?;
-    let mut history_count: u32 = 0;
+    ui.source_count(ui::DataType::Watchlist, watchlist.len());
+
+    ui.status("Counting watch history…");
     let mut history = src.crunchy.watch_history();
     history.page_size(HISTORY_PAGE_SIZE);
-    if let Some(total) = history.total().await {
-        history_count = total;
-    } else {
-        // No total from the API: walk every page. Propagate errors, since a
-        // failing page is refetched forever rather than skipped.
-        while let Some(entry) = history.next().await {
-            entry.context("Failed to read watch history")?;
-            history_count += 1;
-            if history_count.is_multiple_of(HISTORY_PAGE_SIZE) {
-                ui.status(&format!("Counting watch history… {history_count}"));
+    let history_count = match history.total().await {
+        Some(total) => total as usize,
+        None => {
+            // No total from the API: walk every page. Propagate errors, since a
+            // failing page is refetched forever rather than skipped.
+            let mut n = 0;
+            while let Some(entry) = history.next().await {
+                entry.context("Failed to read watch history")?;
+                n += 1;
+                if n % HISTORY_PAGE_SIZE as usize == 0 {
+                    ui.source_count(ui::DataType::History, n);
+                }
             }
+            n
         }
-    }
-    let crunchylists = src.crunchy.crunchylists().await?;
-    ui.finish();
+    };
+    ui.source_count(ui::DataType::History, history_count);
 
-    println!("Account");
-    println!("  Premium   {}", if is_premium { "yes" } else { "no" });
-    println!("  Profiles  {}", session.profiles.len());
-    for p in &session.profiles {
-        let marker = if p.profile_id == selected.profile_id {
-            "›"
-        } else {
-            " "
-        };
-        let primary = if p.is_primary { "  (primary)" } else { "" };
-        println!("    {marker} {}{primary}", p.profile_name);
-    }
-    println!("\n'{}'", src.profile_name);
-    println!("  Watchlist      {}", watchlist.len());
-    println!("  Watch history  {history_count}");
-    println!("  Crunchylists   {}", crunchylists.items.len());
+    ui.status("Reading crunchylists…");
+    let crunchylists = src.crunchy.crunchylists().await?;
+    let list_items: usize = crunchylists.items.iter().map(|l| l.total as usize).sum();
+    ui.source_count(ui::DataType::Crunchylists, list_items);
+    ui.finish();
     Ok(())
 }
 
-fn select_command() -> anyhow::Result<Command> {
+async fn select_command(ui: &Session) -> anyhow::Result<Command> {
     let items = [
-        "Migrate      Copy a profile into another profile or account",
-        "Status       Show account info, profiles, and data counts",
-        "Export       Save a profile's data to JSON files",
-        "Import       Copy JSON files into a profile",
-        "Diff         Compare JSON files against a profile",
-        "Rename       Rename a profile on the account",
+        ("Migrate", "Copy a profile into another profile or account"),
+        ("Status", "Show a profile's account info and data counts"),
+        ("Export", "Save a profile's data to JSON files"),
+        ("Import", "Copy JSON files into a profile"),
+        ("Diff", "Compare JSON files against a profile"),
+        ("Rename", "Rename a profile"),
     ];
-
-    let idx = dialoguer::Select::new()
-        .with_prompt("What would you like to do?")
-        .items(items)
-        .default(0)
-        .interact()
-        .context("Selection cancelled")?;
+    let idx = ui
+        .select_described(
+            "Command",
+            items
+                .iter()
+                .map(|(n, d)| ((*n).to_string(), Some((*d).to_string())))
+                .collect(),
+        )
+        .await?;
 
     Ok(match idx {
         0 => Command::Migrate {
