@@ -1,5 +1,4 @@
 mod auth;
-mod diff;
 mod export;
 mod import;
 mod models;
@@ -9,7 +8,8 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use crunchyroll_rs::list::WatchlistOptions;
 use futures_util::StreamExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use ui::{Session, Stage};
 
 /// Watch history page size. The library default (20) makes large histories crawl.
 pub const HISTORY_PAGE_SIZE: u32 = 100;
@@ -103,11 +103,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Ensure terminal state is restored on panic (raw mode + alternate screen)
+    // Ensure terminal state is restored on panic (raw mode, bracketed paste, cursor)
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        ui::restore_terminal();
         original_hook(info);
     }));
 
@@ -119,68 +118,19 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match command {
-        Command::Status { cookie, profile } => {
-            let session = auth::initial_login(cookie, "").await?;
-            let is_premium = session.crunchy.premium().await;
-
-            println!("Account");
-            println!("  Premium: {}", if is_premium { "yes" } else { "no" });
-            println!("  Profiles: {} found\n", session.profiles.len());
-
-            for p in &session.profiles {
-                let flags = [
-                    p.is_primary.then_some("primary"),
-                    p.is_selected.then_some("selected"),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-
-                let suffix = if flags.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", flags.join(", "))
-                };
-                println!("  - {}{}", p.profile_name, suffix);
-            }
-
-            let selected = auth::select_profile(&session.profiles, profile, true)?;
-            let profile_name = selected.profile_name.clone();
-            let crunchy =
-                auth::switch_profile(&session.refresh_token, selected, session.device).await?;
-
-            let watchlist = crunchy.watchlist(WatchlistOptions::default()).await?;
-            let mut history_count: u32 = 0;
-            let mut history = crunchy.watch_history();
-            history.page_size(HISTORY_PAGE_SIZE);
-            if let Some(total) = history.total().await {
-                history_count = total;
-            } else {
-                // No total from the API: walk every page. Propagate errors, since a
-                // failing page is refetched forever rather than skipped.
-                while let Some(entry) = history.next().await {
-                    entry.context("Failed to read watch history")?;
-                    history_count += 1;
-                    if history_count.is_multiple_of(HISTORY_PAGE_SIZE) {
-                        eprint!("\r  Counting watch history... {history_count}");
-                    }
-                }
-                eprint!("\r\x1b[K");
-            }
-            let crunchylists = crunchy.crunchylists().await?;
-
-            println!("\nData for '{profile_name}'");
-            println!("  Watchlist:     {} items", watchlist.len());
-            println!("  Watch history: {history_count} items");
-            println!("  Crunchylists:  {} lists", crunchylists.items.len());
-        }
+        Command::Status { cookie, profile } => status(cookie, profile).await?,
         Command::Export {
             cookie,
             profile,
             output_dir,
         } => {
-            let crunchy = auth::login(cookie, profile, "", false).await?;
-            export::run(&crunchy, &output_dir).await?;
+            let ui = Session::start("Export", &[Stage::SignIn, Stage::Read]);
+            ui.stage(Stage::SignIn);
+            let src = auth::login(&ui, cookie, profile, "", false).await?;
+            ui.route(&src.profile_name);
+            export::run(&src.crunchy, &src.profile_name, &output_dir, &ui).await?;
+            ui.finish();
+            println!("Saved to {}", display_path(&output_dir));
         }
         Command::Import {
             cookie,
@@ -188,32 +138,68 @@ async fn main() -> anyhow::Result<()> {
             input_dir,
             dry_run,
         } => {
-            let crunchy = auth::login(cookie, profile, "", true).await?;
-            import::run(&crunchy, &input_dir, dry_run).await?;
+            let exports = import::Exports::load(&input_dir)?;
+            let steps: &[Stage] = if dry_run {
+                &[Stage::SignIn, Stage::Read, Stage::Compare]
+            } else {
+                &[Stage::SignIn, Stage::Read, Stage::Compare, Stage::Copy]
+            };
+            let ui = Session::start(
+                if dry_run {
+                    "Import (dry run)"
+                } else {
+                    "Import"
+                },
+                steps,
+            );
+            ui.stage(Stage::SignIn);
+            let dst = auth::login(&ui, cookie, profile, "", true).await?;
+            ui.route(&format!(
+                "{} → {}",
+                exports.watchlist.metadata.profile_name, dst.profile_name
+            ));
+            exports.report_source(&ui);
+            let target = import::compare(&dst.crunchy, &exports, &ui).await?;
+            if !dry_run {
+                import::copy(&dst.crunchy, &exports, &target, &ui).await?;
+            }
+            ui.finish();
         }
         Command::Diff {
             cookie,
             profile,
             input_dir,
         } => {
-            let crunchy = auth::login(cookie, profile, "", true).await?;
-            diff::run(&crunchy, &input_dir).await?;
+            let exports = import::Exports::load(&input_dir)?;
+            let ui = Session::start("Diff", &[Stage::SignIn, Stage::Read, Stage::Compare]);
+            ui.stage(Stage::SignIn);
+            let dst = auth::login(&ui, cookie, profile, "", true).await?;
+            ui.route(&format!(
+                "{} → {}",
+                exports.watchlist.metadata.profile_name, dst.profile_name
+            ));
+            exports.report_source(&ui);
+            import::compare(&dst.crunchy, &exports, &ui).await?;
+            ui.finish();
         }
         Command::RenameProfile {
             cookie,
             profile,
             new_name,
         } => {
-            let session = auth::initial_login(cookie, "").await?;
-            let mut target = auth::select_profile(&session.profiles, profile, false)?.clone();
-            let new_name = new_name.unwrap_or_else(|| {
-                dialoguer::Input::new()
-                    .with_prompt("New profile name")
-                    .interact_text()
-                    .expect("Failed to read new name")
-            });
+            let ui = Session::prompts_only("Rename profile");
+            let session = auth::initial_login(&ui, cookie, "").await?;
+            let mut target = auth::select_profile(&ui, &session.profiles, profile, false)
+                .await?
+                .clone();
+            let new_name = match new_name {
+                Some(n) => n,
+                None => ui.text("New profile name").await?,
+            };
+            let old_name = target.profile_name.clone();
             target.change_profile_name(new_name.clone()).await?;
-            println!("Renamed to '{new_name}'");
+            ui.finish();
+            println!("Renamed '{old_name}' to '{new_name}'");
         }
         Command::Migrate {
             source_cookie,
@@ -223,66 +209,165 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
             keep_data,
         } => {
-            let source_cookie = auth::resolve_cookie(source_cookie, "Source")?;
-            let target_cookie = target_cookie.or_else(auth::prompt_target_cookie);
-            let same_account = target_cookie.is_none();
-            let target_cookie = target_cookie.unwrap_or_else(|| source_cookie.clone());
-
-            println!("=== Step 1: Export from source ===\n");
-            let source = auth::login(Some(source_cookie), source_profile, "Source", false).await?;
-            let source_profile_id = source.profile_id().await;
-            export::run(&source, &data_dir).await?;
-            drop(source);
-
-            println!("\n=== Step 2: Login to target ===\n");
-            if same_account {
-                println!("Same account: pick (or create) the profile to copy into.");
-            }
-            let target = auth::login(Some(target_cookie), target_profile, "Target", true).await?;
-            if same_account && target.profile_id().await == source_profile_id {
-                anyhow::bail!("Source and target are the same profile; nothing to migrate");
-            }
-
-            println!("=== Step 3: Diff ===");
-            diff::run(&target, &data_dir).await?;
-
-            let proceed = dialoguer::Confirm::new()
-                .with_prompt("Proceed with import?")
-                .default(true)
-                .interact()?;
-
-            if !proceed {
-                println!("Aborted.");
-                return Ok(());
-            }
-
-            println!("\n=== Step 4: Import ===\n");
-            import::run(&target, &data_dir, false).await?;
-
-            if keep_data {
-                println!(
-                    "\nMigration complete. Export kept in {}",
-                    data_dir.display()
-                );
-            } else {
-                std::fs::remove_dir_all(&data_dir).with_context(|| {
-                    format!("Migrated, but failed to delete {}", data_dir.display())
-                })?;
-                println!("\nMigration complete. Removed {}", data_dir.display());
-            }
+            migrate(
+                source_cookie,
+                source_profile,
+                target_cookie,
+                target_profile,
+                &data_dir,
+                keep_data,
+            )
+            .await?;
         }
     }
 
     Ok(())
 }
 
+fn display_path(p: &Path) -> String {
+    std::fs::canonicalize(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .display()
+        .to_string()
+}
+
+async fn migrate(
+    source_cookie: Option<String>,
+    source_profile: Option<String>,
+    target_cookie: Option<String>,
+    target_profile: Option<String>,
+    data_dir: &Path,
+    keep_data: bool,
+) -> anyhow::Result<()> {
+    let ui = Session::start(
+        "Migrate",
+        &[
+            Stage::Source,
+            Stage::Read,
+            Stage::Target,
+            Stage::Compare,
+            Stage::Copy,
+        ],
+    );
+
+    ui.stage(Stage::Source);
+    let source_cookie = auth::resolve_cookie(&ui, source_cookie, "Source").await?;
+    let src = auth::login(
+        &ui,
+        Some(source_cookie.clone()),
+        source_profile,
+        "Source",
+        false,
+    )
+    .await?;
+    ui.route(&src.profile_name);
+    let source_profile_id = src.crunchy.profile_id().await;
+    export::run(&src.crunchy, &src.profile_name, data_dir, &ui).await?;
+    drop(src.crunchy);
+
+    ui.stage(Stage::Target);
+    let target_cookie = match target_cookie {
+        Some(c) => Some(c),
+        None => auth::prompt_target_cookie(&ui).await?,
+    };
+    let same_account = target_cookie.is_none();
+    let target_cookie = target_cookie.unwrap_or(source_cookie);
+    let dst = auth::login(&ui, Some(target_cookie), target_profile, "Target", true).await?;
+    if same_account && dst.crunchy.profile_id().await == source_profile_id {
+        anyhow::bail!("Source and target are the same profile; nothing to migrate");
+    }
+    ui.route(&format!("{} → {}", src.profile_name, dst.profile_name));
+
+    let exports = import::Exports::load(data_dir)?;
+    let target = import::compare(&dst.crunchy, &exports, &ui).await?;
+
+    let to_copy = ui.total_to_copy();
+    if to_copy == 0 {
+        ui.note(&format!("'{}' already has everything", dst.profile_name));
+    } else if ui
+        .confirm(&format!(
+            "Copy {to_copy} items into '{}'?",
+            dst.profile_name
+        ))
+        .await?
+    {
+        import::copy(&dst.crunchy, &exports, &target, &ui).await?;
+    } else {
+        ui.finish();
+        println!("Nothing copied.");
+        return Ok(());
+    }
+    ui.finish();
+
+    if keep_data {
+        println!("Export kept in {}", display_path(data_dir));
+    } else {
+        std::fs::remove_dir_all(data_dir)
+            .with_context(|| format!("Migrated, but failed to delete {}", data_dir.display()))?;
+    }
+    Ok(())
+}
+
+async fn status(cookie: Option<String>, profile: Option<String>) -> anyhow::Result<()> {
+    let ui = Session::prompts_only("Status");
+    let session = auth::initial_login(&ui, cookie, "").await?;
+    let is_premium = session.crunchy.premium().await;
+    let selected = auth::select_profile(&ui, &session.profiles, profile, true).await?;
+    let src = auth::switch_profile(
+        &ui,
+        &session.refresh_token,
+        selected,
+        session.device.clone(),
+    )
+    .await?;
+
+    ui.status("Reading watchlist…");
+    let watchlist = src.crunchy.watchlist(WatchlistOptions::default()).await?;
+    let mut history_count: u32 = 0;
+    let mut history = src.crunchy.watch_history();
+    history.page_size(HISTORY_PAGE_SIZE);
+    if let Some(total) = history.total().await {
+        history_count = total;
+    } else {
+        // No total from the API: walk every page. Propagate errors, since a
+        // failing page is refetched forever rather than skipped.
+        while let Some(entry) = history.next().await {
+            entry.context("Failed to read watch history")?;
+            history_count += 1;
+            if history_count.is_multiple_of(HISTORY_PAGE_SIZE) {
+                ui.status(&format!("Counting watch history… {history_count}"));
+            }
+        }
+    }
+    let crunchylists = src.crunchy.crunchylists().await?;
+    ui.finish();
+
+    println!("Account");
+    println!("  Premium   {}", if is_premium { "yes" } else { "no" });
+    println!("  Profiles  {}", session.profiles.len());
+    for p in &session.profiles {
+        let marker = if p.profile_id == selected.profile_id {
+            "›"
+        } else {
+            " "
+        };
+        let primary = if p.is_primary { "  (primary)" } else { "" };
+        println!("    {marker} {}{primary}", p.profile_name);
+    }
+    println!("\n'{}'", src.profile_name);
+    println!("  Watchlist      {}", watchlist.len());
+    println!("  Watch history  {history_count}");
+    println!("  Crunchylists   {}", crunchylists.items.len());
+    Ok(())
+}
+
 fn select_command() -> anyhow::Result<Command> {
     let items = [
-        "Migrate      Full flow: export -> diff -> confirm -> import",
+        "Migrate      Copy a profile into another profile or account",
         "Status       Show account info, profiles, and data counts",
-        "Export       Export one profile's data to JSON files",
-        "Import       Import from JSON files into a profile",
-        "Diff         Compare exported data against target account",
+        "Export       Save a profile's data to JSON files",
+        "Import       Copy JSON files into a profile",
+        "Diff         Compare JSON files against a profile",
         "Rename       Rename a profile on the account",
     ];
 

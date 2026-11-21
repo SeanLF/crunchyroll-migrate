@@ -1,7 +1,7 @@
 use crate::models::{
     self, CrunchylistsExport, RatingItem, RatingsExport, WatchHistoryExport, WatchlistExport,
 };
-use crate::ui::{self, DataType, ProgressReporter, ProgressUpdate};
+use crate::ui::{DataType, Outcome, Session, Stage, show_key};
 use anyhow::{Context, Result};
 use crunchyroll_rs::error::ErrorKind;
 use crunchyroll_rs::{Crunchyroll, MediaCollection};
@@ -16,74 +16,101 @@ const CONCURRENCY: usize = 5;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_RETRIES: u32 = 5;
 
-struct Counts {
-    total: usize,
-    added: usize,
-    already_present: usize,
-    failed: usize,
+/// The four export files.
+pub struct Exports {
+    pub watchlist: WatchlistExport,
+    pub history: WatchHistoryExport,
+    pub crunchylists: CrunchylistsExport,
+    pub ratings: RatingsExport,
 }
 
-impl Counts {
-    fn new(total: usize) -> Self {
-        Self {
-            total,
-            added: 0,
-            already_present: 0,
-            failed: 0,
+impl Exports {
+    pub fn load(dir: &Path) -> Result<Self> {
+        Ok(Self {
+            watchlist: models::read_export(dir, "watchlist.json")?,
+            history: models::read_export(dir, "watch_history.json")?,
+            crunchylists: models::read_export(dir, "crunchylists.json")?,
+            ratings: models::read_export(dir, "ratings.json")?,
+        })
+    }
+
+    /// Fill the "On source" column from files (import/diff read a previous export).
+    pub fn report_source(&self, ui: &Session) {
+        ui.stage(Stage::Read);
+        for i in &self.watchlist.items {
+            ui.source(DataType::Watchlist, &show_key(&i.title, ""));
         }
-    }
-
-    fn processed(&self) -> usize {
-        self.added + self.already_present + self.failed
-    }
-
-    fn to_update(&self, data_type: DataType) -> ProgressUpdate {
-        ProgressUpdate {
-            data_type,
-            total: self.total,
-            processed: self.processed(),
-            added: self.added,
-            skipped: 0,
-            already_present: self.already_present,
-            failed: self.failed,
+        for i in &self.history.items {
+            ui.source(DataType::History, &show_key(&i.series_title, &i.title));
+        }
+        for i in self.crunchylists.lists.iter().flat_map(|l| &l.items) {
+            ui.source(DataType::Crunchylists, &show_key(&i.title, ""));
+        }
+        for i in &self.ratings.items {
+            ui.source(DataType::Ratings, &show_key(&i.title, ""));
         }
     }
 }
 
-pub async fn run(crunchy: &Crunchyroll, input_dir: &Path, dry_run: bool) -> Result<()> {
-    if dry_run {
-        println!("Dry run -- showing what would be imported:\n");
-        return crate::diff::run(crunchy, input_dir).await;
+/// Check the target profile and plan every source item as "already there" or "to copy".
+pub async fn compare(crunchy: &Crunchyroll, ex: &Exports, ui: &Session) -> Result<TargetState> {
+    ui.stage(Stage::Compare);
+    ui.status("Checking the target profile…");
+    let target = fetch_target_state(crunchy).await?;
+
+    for i in &ex.watchlist.items {
+        let already = target.watchlist_ids.contains(&i.content_id);
+        ui.planned(DataType::Watchlist, &show_key(&i.title, ""), already);
     }
-
-    let watchlist: WatchlistExport = models::read_export(input_dir, "watchlist.json")?;
-    let history: WatchHistoryExport = models::read_export(input_dir, "watch_history.json")?;
-    let crunchylists: CrunchylistsExport = models::read_export(input_dir, "crunchylists.json")?;
-    let ratings: RatingsExport = models::read_export(input_dir, "ratings.json")?;
-
-    println!("Checking what the target profile already has...");
-    let target_state = fetch_target_state(crunchy).await?;
-
-    let profile = crate::auth::current_profile_name(crunchy).await;
-    let (reporter, dashboard) = ui::start_dashboard("Import", &profile);
-
-    let wl = import_watchlist(crunchy, &watchlist, &target_state, &reporter).await?;
-    let cl = import_crunchylists(crunchy, &crunchylists, &target_state, &reporter).await?;
-    let rt = import_ratings(crunchy, &ratings, &reporter).await?;
-    let hi = import_history(crunchy, &history, &target_state, &reporter).await?;
-
-    reporter.done();
-    dashboard.wait();
-
-    if !ui::is_tty() {
-        print_summary(&[
-            ("Watchlist", &wl),
-            ("Crunchylists", &cl),
-            ("Ratings", &rt),
-            ("History", &hi),
-        ]);
+    for i in &ex.history.items {
+        let already = target.history_ids.contains(&i.content_id);
+        ui.planned(
+            DataType::History,
+            &show_key(&i.series_title, &i.title),
+            already,
+        );
     }
+    for list in &ex.crunchylists.lists {
+        let existing = target.crunchylists.get(&list.name);
+        for i in &list.items {
+            let already = existing.is_some_and(|ids| ids.contains(&i.content_id));
+            ui.planned(DataType::Crunchylists, &show_key(&i.title, ""), already);
+        }
+    }
+    // Ratings are always written; the target's ratings aren't read up front
+    for i in &ex.ratings.items {
+        ui.planned(DataType::Ratings, &show_key(&i.title, ""), false);
+    }
+    ui.compared();
+    ui.status("");
+    Ok(target)
+}
+
+/// Write everything the compare step planned.
+pub async fn copy(
+    crunchy: &Crunchyroll,
+    ex: &Exports,
+    target: &TargetState,
+    ui: &Session,
+) -> Result<()> {
+    ui.stage(Stage::Copy);
+    import_watchlist(crunchy, &ex.watchlist, target, ui).await?;
+    import_crunchylists(crunchy, &ex.crunchylists, target, ui).await?;
+    import_ratings(crunchy, &ex.ratings, ui).await?;
+    import_history(crunchy, &ex.history, target, ui).await?;
     Ok(())
+}
+
+fn record(ui: &Session, kind: DataType, show: &str, label: &str, result: &Result<()>) {
+    let outcome = match result {
+        Ok(()) => Outcome::Copied,
+        Err(e) if is_conflict(e) => Outcome::Already,
+        Err(e) => {
+            ui.warn(&format!("{label}: {e:#}"));
+            Outcome::Failed
+        }
+    };
+    ui.copied(kind, show, outcome);
 }
 
 pub struct TargetState {
@@ -93,7 +120,7 @@ pub struct TargetState {
     pub crunchylists: HashMap<String, HashSet<String>>,
 }
 
-pub async fn fetch_target_state(crunchy: &Crunchyroll) -> Result<TargetState> {
+async fn fetch_target_state(crunchy: &Crunchyroll) -> Result<TargetState> {
     use crunchyroll_rs::list::WatchlistOptions;
 
     let watchlist = crunchy.watchlist(WatchlistOptions::default()).await?;
@@ -132,52 +159,33 @@ async fn import_watchlist(
     crunchy: &Crunchyroll,
     export: &WatchlistExport,
     target: &TargetState,
-    reporter: &ProgressReporter,
-) -> Result<Counts> {
-    let mut c = Counts::new(export.items.len());
-
-    let to_import: Vec<_> = export
-        .items
-        .iter()
-        .filter(|item| !target.watchlist_ids.contains(&item.content_id))
-        .collect();
-    c.already_present = export.items.len() - to_import.len();
-    reporter.progress(c.to_update(DataType::Watchlist));
-
-    let mut results = stream::iter(to_import)
-        .map(|item| {
-            let cr = crunchy.clone();
-            let content_id = item.content_id.clone();
-            let content_type = item.content_type.clone();
-            let title = item.title.clone();
-            async move {
-                let result =
-                    retry_with_backoff(|| add_to_watchlist(&cr, &content_id, &content_type)).await;
-                tokio::time::sleep(WRITE_DELAY).await;
-                (title, result)
-            }
-        })
-        .buffer_unordered(CONCURRENCY);
-
-    while let Some((title, result)) = results.next().await {
-        match result {
-            Ok(()) => {
-                reporter.log_success(&title);
-                c.added += 1;
-            }
-            Err(e) if is_conflict(&e) => {
-                reporter.log_skip(&title);
-                c.already_present += 1;
-            }
-            Err(e) => {
-                reporter.log_error(&format!("{title} -- {e}"));
-                c.failed += 1;
-            }
+    ui: &Session,
+) -> Result<()> {
+    let notify = |m: &str| ui.status(m);
+    let mut results = stream::iter(
+        export
+            .items
+            .iter()
+            .filter(|item| !target.watchlist_ids.contains(&item.content_id)),
+    )
+    .map(|item| {
+        let notify = &notify;
+        async move {
+            let result = retry_with_backoff(notify, || {
+                add_to_watchlist(crunchy, &item.content_id, &item.content_type)
+            })
+            .await;
+            tokio::time::sleep(WRITE_DELAY).await;
+            (item, result)
         }
-        reporter.progress(c.to_update(DataType::Watchlist));
-    }
+    })
+    .buffer_unordered(CONCURRENCY);
 
-    Ok(c)
+    while let Some((item, result)) = results.next().await {
+        let show = show_key(&item.title, "");
+        record(ui, DataType::Watchlist, &show, &item.title, &result);
+    }
+    Ok(())
 }
 
 async fn add_to_watchlist(
@@ -203,67 +211,45 @@ async fn import_crunchylists(
     crunchy: &Crunchyroll,
     export: &CrunchylistsExport,
     target: &TargetState,
-    reporter: &ProgressReporter,
-) -> Result<Counts> {
-    let total_items: usize = export.lists.iter().map(|l| l.items.len()).sum();
-    let mut c = Counts::new(total_items);
-    reporter.progress(c.to_update(DataType::Crunchylists));
-
+    ui: &Session,
+) -> Result<()> {
+    let notify = |m: &str| ui.status(m);
     for list_data in &export.lists {
         let existing_items = target.crunchylists.get(&list_data.name);
 
         // Get or create the list on the target
+        let lists = crunchy.crunchylists().await?;
         let full_list = if existing_items.is_some() {
-            let lists = crunchy.crunchylists().await?;
             let preview = lists
                 .items
                 .iter()
                 .find(|p| p.title == list_data.name)
                 .with_context(|| format!("Finding crunchylist '{}'", list_data.name))?;
-            reporter.log_skip(&format!(
-                "'{}' already exists, checking items",
-                list_data.name
-            ));
             preview.crunchylist().await?
         } else {
-            let lists = crunchy.crunchylists().await?;
             let preview = lists
                 .create(&list_data.name)
                 .await
                 .with_context(|| format!("Creating crunchylist '{}'", list_data.name))?;
-            reporter.log_success(&format!("Created list '{}'", list_data.name));
+            ui.note(&format!("Created list '{}'", list_data.name));
             preview.crunchylist().await?
         };
 
         for item in &list_data.items {
             if existing_items.is_some_and(|ids| ids.contains(&item.content_id)) {
-                c.already_present += 1;
-                reporter.progress(c.to_update(DataType::Crunchylists));
                 continue;
             }
-
-            match retry_with_backoff(|| add_to_crunchylist(crunchy, &full_list, &item.content_id))
-                .await
-            {
-                Ok(()) => {
-                    reporter.log_success(&format!("  {} -> {}", list_data.name, item.title));
-                    c.added += 1;
-                }
-                Err(e) if is_conflict(&e) => {
-                    c.already_present += 1;
-                }
-                Err(e) => {
-                    reporter.log_error(&format!("{} -- {}", item.title, e));
-                    c.failed += 1;
-                }
-            }
-
-            reporter.progress(c.to_update(DataType::Crunchylists));
+            let result = retry_with_backoff(&notify, || {
+                add_to_crunchylist(crunchy, &full_list, &item.content_id)
+            })
+            .await;
+            let show = show_key(&item.title, "");
+            let label = format!("{} → {}", item.title, list_data.name);
+            record(ui, DataType::Crunchylists, &show, &label, &result);
             tokio::time::sleep(WRITE_DELAY).await;
         }
     }
-
-    Ok(c)
+    Ok(())
 }
 
 async fn add_to_crunchylist(
@@ -287,31 +273,15 @@ async fn add_to_crunchylist(
     Ok(())
 }
 
-async fn import_ratings(
-    crunchy: &Crunchyroll,
-    export: &RatingsExport,
-    reporter: &ProgressReporter,
-) -> Result<Counts> {
-    let mut c = Counts::new(export.items.len());
-    reporter.progress(c.to_update(DataType::Ratings));
-
+async fn import_ratings(crunchy: &Crunchyroll, export: &RatingsExport, ui: &Session) -> Result<()> {
+    let notify = |m: &str| ui.status(m);
     for item in &export.items {
-        match retry_with_backoff(|| set_rating(crunchy, item)).await {
-            Ok(()) => {
-                reporter.log_success(&format!("{} ({})", item.title, item.rating));
-                c.added += 1;
-            }
-            Err(e) => {
-                reporter.log_error(&format!("{} -- {}", item.title, e));
-                c.failed += 1;
-            }
-        }
-
-        reporter.progress(c.to_update(DataType::Ratings));
+        let result = retry_with_backoff(&notify, || set_rating(crunchy, item)).await;
+        let show = show_key(&item.title, "");
+        record(ui, DataType::Ratings, &show, &item.title, &result);
         tokio::time::sleep(WRITE_DELAY).await;
     }
-
-    Ok(c)
+    Ok(())
 }
 
 async fn set_rating(crunchy: &Crunchyroll, item: &RatingItem) -> Result<()> {
@@ -344,64 +314,50 @@ async fn import_history(
     crunchy: &Crunchyroll,
     export: &WatchHistoryExport,
     target: &TargetState,
-    reporter: &ProgressReporter,
-) -> Result<Counts> {
-    let mut c = Counts::new(export.items.len());
-
-    let to_import: Vec<_> = export
-        .items
-        .iter()
-        .filter(|item| !target.history_ids.contains(&item.content_id))
-        .collect();
-    c.already_present = export.items.len() - to_import.len();
-    reporter.progress(c.to_update(DataType::History));
-
+    ui: &Session,
+) -> Result<()> {
     // Pre-fetch account_id once instead of per-request
     let account_id: Arc<str> = crunchy.account().await?.account_id.into();
+    let notify = |m: &str| ui.status(m);
 
-    let mut results = stream::iter(to_import)
-        .map(|item| {
-            let cr = crunchy.clone();
-            let account_id = account_id.clone();
-            let content_id = item.content_id.clone();
-            let playhead = item.playhead;
-            let fully_watched = item.fully_watched;
-            let label = match (item.series_title.is_empty(), item.title.is_empty()) {
-                (_, true) => format!("{} (no title in export)", item.content_id),
-                (true, false) => item.title.clone(),
-                (false, false) => format!("{} - {}", item.series_title, item.title),
+    let mut results = stream::iter(
+        export
+            .items
+            .iter()
+            .filter(|item| !target.history_ids.contains(&item.content_id)),
+    )
+    .map(|item| {
+        let account_id = account_id.clone();
+        let notify = &notify;
+        async move {
+            let id = item.content_id.as_str();
+            let result = if item.fully_watched {
+                retry_with_backoff(notify, || mark_as_watched(crunchy, &account_id, id)).await
+            } else if item.playhead > 0 {
+                // Restore playhead so the user can resume where they left off
+                retry_with_backoff(notify, || {
+                    set_playhead(crunchy, &account_id, id, item.playhead)
+                })
+                .await
+            } else {
+                Ok(())
             };
-            async move {
-                let result = if fully_watched {
-                    retry_with_backoff(|| mark_as_watched(&cr, &account_id, &content_id)).await
-                } else if playhead > 0 {
-                    // Restore playhead so the user can resume where they left off
-                    retry_with_backoff(|| set_playhead(&cr, &account_id, &content_id, playhead))
-                        .await
-                } else {
-                    Ok(())
-                };
-                tokio::time::sleep(WRITE_DELAY).await;
-                (label, result)
-            }
-        })
-        .buffer_unordered(CONCURRENCY);
-
-    while let Some((label, result)) = results.next().await {
-        match result {
-            Ok(()) => {
-                reporter.log_success(&label);
-                c.added += 1;
-            }
-            Err(e) => {
-                reporter.log_error(&format!("{label} -- {e}"));
-                c.failed += 1;
-            }
+            tokio::time::sleep(WRITE_DELAY).await;
+            (item, result)
         }
-        reporter.progress(c.to_update(DataType::History));
-    }
+    })
+    .buffer_unordered(CONCURRENCY);
 
-    Ok(c)
+    while let Some((item, result)) = results.next().await {
+        let show = show_key(&item.series_title, &item.title);
+        let label = if item.title.is_empty() {
+            format!("{show} ({})", item.content_id)
+        } else {
+            format!("{show} - {}", item.title)
+        };
+        record(ui, DataType::History, &show, &label, &result);
+    }
+    Ok(())
 }
 
 async fn set_playhead(
@@ -459,7 +415,8 @@ fn check_status(status: u16, operation: &str, content_id: &str) -> Result<()> {
     }
 }
 
-async fn retry_with_backoff<F, Fut>(mut f: F) -> Result<()>
+/// Retry transient failures with exponential backoff. `notify` reports long waits.
+async fn retry_with_backoff<F, Fut>(notify: &dyn Fn(&str), mut f: F) -> Result<()>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
@@ -470,7 +427,7 @@ where
         match f().await {
             Ok(()) => return Ok(()),
             Err(e) if attempt < MAX_RETRIES && is_cloudflare_block(&e) => {
-                eprintln!("  Cloudflare block detected, waiting 60s before retry...");
+                notify("Cloudflare is blocking requests; waiting 60s before retrying");
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
             Err(e) if attempt < MAX_RETRIES && is_transient(&e) => {
@@ -515,67 +472,9 @@ fn is_conflict(e: &anyhow::Error) -> bool {
     false
 }
 
-fn print_summary(sections: &[(&str, &Counts)]) {
-    println!("\n  Import Summary");
-    println!("  {}", "\u{2500}".repeat(50));
-
-    let mut total_added = 0;
-    let mut total_already = 0;
-    let mut total_failed = 0;
-
-    for (name, c) in sections {
-        println!(
-            "  {:14} {} added, {} already there, {} failed",
-            name, c.added, c.already_present, c.failed
-        );
-        total_added += c.added;
-        total_already += c.already_present;
-        total_failed += c.failed;
-    }
-
-    println!("  {}", "\u{2500}".repeat(50));
-    println!(
-        "  {:14} {} added, {} already there, {} failed",
-        "Total", total_added, total_already, total_failed
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn counts_new_starts_at_zero() {
-        let c = Counts::new(42);
-        assert_eq!(c.total, 42);
-        assert_eq!(c.added, 0);
-        assert_eq!(c.already_present, 0);
-        assert_eq!(c.failed, 0);
-        assert_eq!(c.processed(), 0);
-    }
-
-    #[test]
-    fn counts_processed_sums_all() {
-        let mut c = Counts::new(10);
-        c.added = 3;
-        c.already_present = 4;
-        c.failed = 2;
-        assert_eq!(c.processed(), 9);
-    }
-
-    #[test]
-    fn counts_to_update_maps_correctly() {
-        let mut c = Counts::new(10);
-        c.added = 5;
-        c.already_present = 3;
-        c.failed = 1;
-        let u = c.to_update(crate::ui::DataType::Watchlist);
-        assert_eq!(u.total, 10);
-        assert_eq!(u.processed, 9);
-        assert_eq!(u.added, 5);
-        assert_eq!(u.already_present, 3);
-        assert_eq!(u.failed, 1);
-    }
 
     #[test]
     fn is_transient_matches_status_strings() {
@@ -610,7 +509,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_succeeds_immediately() {
-        let result = retry_with_backoff(|| async { Ok(()) }).await;
+        let result = retry_with_backoff(&|_| {}, || async { Ok(()) }).await;
         assert!(result.is_ok());
     }
 
@@ -618,7 +517,7 @@ mod tests {
     async fn retry_succeeds_after_transient_failure() {
         let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count_clone = count.clone();
-        let result = retry_with_backoff(move || {
+        let result = retry_with_backoff(&|_| {}, move || {
             let c = count_clone.clone();
             async move {
                 let attempt = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -636,8 +535,10 @@ mod tests {
 
     #[tokio::test]
     async fn retry_gives_up_on_permanent_error() {
-        let result =
-            retry_with_backoff(|| async { Err::<(), _>(anyhow::anyhow!("400 bad request")) }).await;
+        let result = retry_with_backoff(&|_| {}, || async {
+            Err::<(), _>(anyhow::anyhow!("400 bad request"))
+        })
+        .await;
         assert!(result.is_err());
     }
 }

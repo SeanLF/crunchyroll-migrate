@@ -2,7 +2,7 @@ use crate::models::{
     CrunchylistData, CrunchylistItem, CrunchylistsExport, ExportMetadata, RatingItem,
     RatingsExport, WatchHistoryExport, WatchHistoryItem, WatchlistExport, WatchlistItem,
 };
-use crate::ui::{self, DataType, ProgressReporter, ProgressUpdate};
+use crate::ui::{DataType, Session, Stage, show_key};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crunchyroll_rs::list::WatchlistOptions;
@@ -12,52 +12,39 @@ use std::collections::HashSet;
 use std::path::Path;
 use tokio::sync::Semaphore;
 
-pub async fn run(crunchy: &Crunchyroll, output_dir: &Path) -> Result<()> {
+/// Read everything from the source profile into `output_dir`, reporting items to `ui`.
+pub async fn run(
+    crunchy: &Crunchyroll,
+    profile_name: &str,
+    output_dir: &Path,
+    ui: &Session,
+) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
+    ui.stage(Stage::Read);
 
-    let profile_name = crate::auth::current_profile_name(crunchy).await;
-    let (reporter, dashboard) = ui::start_dashboard("Export", &profile_name);
-
-    let watchlist = export_watchlist(crunchy, &profile_name, &reporter).await?;
+    ui.status("Reading watchlist…");
+    let watchlist = export_watchlist(crunchy, profile_name, ui).await?;
     write_atomic(output_dir, "watchlist.json", &watchlist)?;
-    reporter.log_success(&format!("Watchlist: {} items", watchlist.items.len()));
 
-    let history = export_history(crunchy, &profile_name, &reporter).await?;
+    ui.status("Reading watch history…");
+    let history = export_history(crunchy, profile_name, ui).await?;
     write_atomic(output_dir, "watch_history.json", &history)?;
-    reporter.log_success(&format!("Watch history: {} items", history.items.len()));
 
-    let crunchylists = export_crunchylists(crunchy, &profile_name, &reporter).await?;
+    ui.status("Reading crunchylists…");
+    let crunchylists = export_crunchylists(crunchy, profile_name, ui).await?;
     write_atomic(output_dir, "crunchylists.json", &crunchylists)?;
-    let list_items: usize = crunchylists.lists.iter().map(|l| l.items.len()).sum();
-    reporter.log_success(&format!(
-        "Crunchylists: {} lists, {} items",
-        crunchylists.lists.len(),
-        list_items
-    ));
 
-    let ratings = export_ratings(
-        crunchy,
-        &profile_name,
-        &watchlist.items,
-        &history.items,
-        &reporter,
-    )
-    .await?;
+    let ratings =
+        export_ratings(crunchy, profile_name, &watchlist.items, &history.items, ui).await?;
     write_atomic(output_dir, "ratings.json", &ratings)?;
-    reporter.log_success(&format!("Ratings: {} rated items", ratings.items.len()));
-
-    reporter.done();
-    dashboard.wait();
-
-    let shown = std::fs::canonicalize(output_dir).unwrap_or_else(|_| output_dir.to_path_buf());
-    println!("Export saved to {}", shown.display());
+    ui.status("");
     Ok(())
 }
 
 async fn export_watchlist(
     crunchy: &Crunchyroll,
     profile_name: &str,
-    reporter: &ProgressReporter,
+    ui: &Session,
 ) -> Result<WatchlistExport> {
     let entries = crunchy
         .watchlist(WatchlistOptions::default())
@@ -79,7 +66,9 @@ async fn export_watchlist(
         })
         .collect();
 
-    reporter.progress(export_progress(DataType::Watchlist, items.len()));
+    for item in &items {
+        ui.source(DataType::Watchlist, &show_key(&item.title, ""));
+    }
 
     Ok(WatchlistExport {
         metadata: ExportMetadata {
@@ -94,12 +83,11 @@ async fn export_watchlist(
 async fn export_history(
     crunchy: &Crunchyroll,
     profile_name: &str,
-    reporter: &ProgressReporter,
+    ui: &Session,
 ) -> Result<WatchHistoryExport> {
     let mut stream = crunchy.watch_history();
     stream.page_size(crate::HISTORY_PAGE_SIZE);
     let mut items = Vec::new();
-    let mut failed = 0;
 
     while let Some(result) = stream.next().await {
         match result {
@@ -113,6 +101,7 @@ async fn export_history(
                     None => (String::new(), String::new(), true),
                 };
 
+                ui.source(DataType::History, &show_key(&series_title, &title));
                 items.push(WatchHistoryItem {
                     content_id: entry.id.clone(),
                     parent_id: entry.parent_id.clone(),
@@ -128,39 +117,15 @@ async fn export_history(
                     fully_watched: entry.fully_watched,
                     partial,
                 });
-
-                if items.len() % 50 == 0 {
-                    reporter.progress(ProgressUpdate {
-                        data_type: DataType::History,
-                        total: 0,
-                        processed: items.len(),
-                        added: items.len(),
-                        skipped: 0,
-                        already_present: 0,
-                        failed,
-                    });
-                }
             }
             Err(e) => {
-                reporter.log_error(&format!("Skipping history entry: {e}"));
-                failed += 1;
+                ui.warn(&format!("Skipped a history entry: {e}"));
             }
         }
     }
 
     // Sort chronologically (oldest first)
     items.sort_by_key(|a| a.date_played);
-
-    reporter.progress(ProgressUpdate {
-        data_type: DataType::History,
-        total: items.len(),
-        processed: items.len(),
-        added: items.len(),
-        skipped: 0,
-        already_present: 0,
-        failed,
-    });
-
     Ok(WatchHistoryExport {
         metadata: ExportMetadata {
             profile_name: profile_name.to_string(),
@@ -174,7 +139,7 @@ async fn export_history(
 async fn export_crunchylists(
     crunchy: &Crunchyroll,
     profile_name: &str,
-    reporter: &ProgressReporter,
+    ui: &Session,
 ) -> Result<CrunchylistsExport> {
     let lists_meta = crunchy
         .crunchylists()
@@ -204,7 +169,9 @@ async fn export_crunchylists(
     }
 
     let total: usize = lists.iter().map(|l| l.items.len()).sum();
-    reporter.progress(export_progress(DataType::Crunchylists, total));
+    for item in lists.iter().flat_map(|l| &l.items) {
+        ui.source(DataType::Crunchylists, &show_key(&item.title, ""));
+    }
 
     Ok(CrunchylistsExport {
         metadata: ExportMetadata {
@@ -221,7 +188,7 @@ async fn export_ratings(
     profile_name: &str,
     watchlist: &[WatchlistItem],
     history: &[WatchHistoryItem],
-    reporter: &ProgressReporter,
+    ui: &Session,
 ) -> Result<RatingsExport> {
     // Collect unique series/movie_listing IDs and their types
     let mut seen: HashSet<String> = HashSet::new();
@@ -269,20 +236,15 @@ async fn export_ratings(
     for handle in handles {
         checked += 1;
         match handle.await {
-            Ok(Some(item)) => items.push(item),
+            Ok(Some(item)) => {
+                ui.source(DataType::Ratings, &show_key(&item.title, ""));
+                items.push(item);
+            }
             Ok(None) => {}
-            Err(e) => reporter.log_error(&format!("Rating task failed: {e}")),
+            Err(e) => ui.warn(&format!("Rating check failed: {e}")),
         }
         if checked % 5 == 0 || checked == total {
-            reporter.progress(ProgressUpdate {
-                data_type: DataType::Ratings,
-                total,
-                processed: checked,
-                added: items.len(),
-                skipped: 0,
-                already_present: 0,
-                failed: 0,
-            });
+            ui.status(&format!("Checking ratings {checked}/{total}…"));
         }
     }
 
@@ -379,19 +341,6 @@ fn panel_series_title(panel: &MediaCollection) -> String {
         MediaCollection::Series(s) => s.title.clone(),
         MediaCollection::MovieListing(ml) => ml.title.clone(),
         _ => String::new(),
-    }
-}
-
-/// Build a progress update for an export phase where all items are "added" (fetched).
-fn export_progress(data_type: DataType, count: usize) -> ProgressUpdate {
-    ProgressUpdate {
-        data_type,
-        total: count,
-        processed: count,
-        added: count,
-        skipped: 0,
-        already_present: 0,
-        failed: 0,
     }
 }
 

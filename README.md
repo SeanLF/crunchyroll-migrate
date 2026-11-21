@@ -93,15 +93,21 @@ Pre-filters against the target account so already-present items are skipped with
 crunchyroll-migrate diff --input-dir ./backup
 ```
 
-Shows what's in the export vs what's already on the target:
+Shows what's in the export vs what's already on the target, per data type and per show:
 
 ```
-  Data Type        In Export  On Target    Missing  Already There
-  ──────────────────────────────────────────────────────────────
-  Watchlist               47         12         35             12
-  History              1,234        200      1,034            200
-  Crunchylists              3          1          2              1
-  Ratings                 15          0         15              0
+ Diff Sean → Sean copy                                     ✓ Done 0m09s
+ ✓ Sign in  ›  ✓ Read  ›  ✓ Compare
+
+                On source   Already there   To copy
+ Watchlist             10               0        10
+ History              663               3       660
+ Crunchylists           0               0         0
+ Ratings                0               0         0
+
+ ○ My Hero Academia                ★ watchlist  0/88 eps
+ ○ Frieren: Beyond Journey's End                0/28 eps
+ ✓ Gachiakuta                                   12 eps
 ```
 
 ### Status
@@ -118,16 +124,17 @@ Shows account info, premium status, profiles, and data counts.
 crunchyroll-migrate rename-profile --profile "Old Name" --new-name "New Name"
 ```
 
-## Terminal dashboard
+## Terminal view
 
-During export and import operations, a live TUI dashboard shows:
+Every command runs in one view drawn in place in your terminal, and stays in scrollback when it's done:
 
-- Progress gauges per data type with ETA
-- Scrollable log of processed items (Up/Down, PgUp/PgDn, Home/End)
-- Running totals of added/skipped/failed
-- Quit with `q` or Ctrl+C (gracefully stops the operation)
+- A step tracker (`Source › Read › Target › Compare › Copy` for a migration)
+- A table per data type whose columns fill in as steps finish: on source, already there, to copy, copied
+- One row per show, with watchlist, episodes copied and ratings; shows being copied move to the top
+- Prompts (cookie, profile, confirm) inside the same view, with hidden cookie input and paste support
+- Failures printed above the view so they stay readable; `q` or Ctrl+C stops (exit code 130)
 
-Falls back to simple line output when stdout is not a terminal (piped, CI).
+Falls back to plain lines when stdin or stdout isn't a terminal (piped, CI).
 
 ## Resilience
 
