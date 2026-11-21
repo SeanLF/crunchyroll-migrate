@@ -3,6 +3,7 @@ use crate::models::{
 };
 use crate::ui::{self, DataType, ProgressReporter, ProgressUpdate};
 use anyhow::{Context, Result};
+use crunchyroll_rs::error::ErrorKind;
 use crunchyroll_rs::{Crunchyroll, MediaCollection};
 use futures_util::{StreamExt, stream};
 use std::collections::{HashMap, HashSet};
@@ -60,11 +61,11 @@ pub async fn run(crunchy: &Crunchyroll, input_dir: &Path, dry_run: bool) -> Resu
     let crunchylists: CrunchylistsExport = models::read_export(input_dir, "crunchylists.json")?;
     let ratings: RatingsExport = models::read_export(input_dir, "ratings.json")?;
 
-    println!("Fetching target account state for pre-filtering...");
+    println!("Checking what the target profile already has...");
     let target_state = fetch_target_state(crunchy).await?;
 
-    let profile = crunchy.profile_id().await;
-    let (reporter, dashboard) = ui::start_dashboard("Import", "", &profile);
+    let profile = crate::auth::current_profile_name(crunchy).await;
+    let (reporter, dashboard) = ui::start_dashboard("Import", &profile);
 
     let wl = import_watchlist(crunchy, &watchlist, &target_state, &reporter).await?;
     let cl = import_crunchylists(crunchy, &crunchylists, &target_state, &reporter).await?;
@@ -103,6 +104,7 @@ pub async fn fetch_target_state(crunchy: &Crunchyroll) -> Result<TargetState> {
 
     let mut history_ids = HashSet::new();
     let mut stream = crunchy.watch_history();
+    stream.page_size(crate::HISTORY_PAGE_SIZE);
     while let Some(Ok(entry)) = stream.next().await {
         history_ids.insert(entry.id.clone());
     }
@@ -168,7 +170,7 @@ async fn import_watchlist(
                 c.already_present += 1;
             }
             Err(e) => {
-                reporter.log_error(&format!("{} -- {}", title, e));
+                reporter.log_error(&format!("{title} -- {e}"));
                 c.failed += 1;
             }
         }
@@ -192,7 +194,7 @@ async fn add_to_watchlist(
             let ml: crunchyroll_rs::MovieListing = crunchy.media_from_id(content_id).await?;
             ml.add_to_watchlist().await?;
         }
-        _ => anyhow::bail!("Unknown content type: {}", content_type),
+        _ => anyhow::bail!("Unknown content type: {content_type}"),
     }
     Ok(())
 }
@@ -280,10 +282,7 @@ async fn add_to_crunchylist(
     {
         list.add(MediaCollection::from(ml)).await?;
     } else {
-        anyhow::bail!(
-            "Content {} not found as series or movie_listing",
-            content_id
-        );
+        anyhow::bail!("Content {content_id} not found as series or movie_listing");
     }
     Ok(())
 }
@@ -324,7 +323,7 @@ async fn set_rating(crunchy: &Crunchyroll, item: &RatingItem) -> Result<()> {
         "ThreeStars" => RatingStar::ThreeStars,
         "FourStars" => RatingStar::FourStars,
         "FiveStars" => RatingStar::FiveStars,
-        other => anyhow::bail!("Unknown rating: {}", other),
+        other => anyhow::bail!("Unknown rating: {other}"),
     };
 
     match item.content_type.as_str() {
@@ -367,10 +366,10 @@ async fn import_history(
             let content_id = item.content_id.clone();
             let playhead = item.playhead;
             let fully_watched = item.fully_watched;
-            let label = if item.title.is_empty() {
-                format!("{} - {}", item.series_title, item.content_id)
-            } else {
-                format!("{} - {}", item.series_title, item.title)
+            let label = match (item.series_title.is_empty(), item.title.is_empty()) {
+                (_, true) => format!("{} (no title in export)", item.content_id),
+                (true, false) => item.title.clone(),
+                (false, false) => format!("{} - {}", item.series_title, item.title),
             };
             async move {
                 let result = if fully_watched {
@@ -395,7 +394,7 @@ async fn import_history(
                 c.added += 1;
             }
             Err(e) => {
-                reporter.log_error(&format!("{} -- {}", label, e));
+                reporter.log_error(&format!("{label} -- {e}"));
                 c.failed += 1;
             }
         }
@@ -411,10 +410,7 @@ async fn set_playhead(
     content_id: &str,
     playhead: u32,
 ) -> Result<()> {
-    let url = format!(
-        "https://www.crunchyroll.com/content/v2/{}/playheads",
-        account_id
-    );
+    let url = format!("https://www.crunchyroll.com/content/v2/{account_id}/playheads");
     let status = crunchy
         .client()
         .post(&url)
@@ -436,8 +432,7 @@ async fn set_playhead(
 
 async fn mark_as_watched(crunchy: &Crunchyroll, account_id: &str, content_id: &str) -> Result<()> {
     let url = format!(
-        "https://www.crunchyroll.com/content/v2/discover/{}/mark_as_watched/{}",
-        account_id, content_id
+        "https://www.crunchyroll.com/content/v2/discover/{account_id}/mark_as_watched/{content_id}"
     );
     let status = crunchy
         .client()
@@ -460,7 +455,7 @@ fn check_status(status: u16, operation: &str, content_id: &str) -> Result<()> {
     if (200..300).contains(&status) || status == 409 {
         Ok(())
     } else {
-        anyhow::bail!("{} returned {} for {}", operation, status, content_id)
+        anyhow::bail!("{operation} returned {status} for {content_id}")
     }
 }
 
@@ -488,17 +483,18 @@ where
     unreachable!()
 }
 
-fn is_cloudflare_block(e: &anyhow::Error) -> bool {
+fn error_kind(e: &anyhow::Error) -> Option<&ErrorKind> {
     e.downcast_ref::<crunchyroll_rs::error::Error>()
-        .is_some_and(|ce| matches!(ce, crunchyroll_rs::error::Error::Block { .. }))
+        .map(crunchyroll_rs::Error::kind)
+}
+
+fn is_cloudflare_block(e: &anyhow::Error) -> bool {
+    matches!(error_kind(e), Some(ErrorKind::Block { .. }))
 }
 
 fn is_transient(e: &anyhow::Error) -> bool {
     // Check structured error first for status code
-    if let Some(crunchyroll_rs::error::Error::Request {
-        status: Some(code), ..
-    }) = e.downcast_ref::<crunchyroll_rs::error::Error>()
-    {
+    if let Some(ErrorKind::Request { status: Some(code) }) = error_kind(e) {
         let n = code.as_u16();
         return n == 429 || (500..=504).contains(&n);
     }
@@ -513,10 +509,7 @@ fn is_transient(e: &anyhow::Error) -> bool {
 }
 
 fn is_conflict(e: &anyhow::Error) -> bool {
-    if let Some(crunchyroll_rs::error::Error::Request {
-        status: Some(code), ..
-    }) = e.downcast_ref::<crunchyroll_rs::error::Error>()
-    {
+    if let Some(ErrorKind::Request { status: Some(code) }) = error_kind(e) {
         return code.as_u16() == 409;
     }
     false

@@ -9,7 +9,7 @@ use ratatui::{
     prelude::CrosstermBackend,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph},
+    widgets::{Block, Borders, LineGauge, Paragraph},
 };
 use std::io::{self, IsTerminal};
 use std::sync::{Arc, Mutex};
@@ -65,7 +65,6 @@ pub fn is_tty() -> bool {
 
 pub struct DashboardState {
     pub operation: String,
-    pub account: String,
     pub profile: String,
     pub started: Instant,
     pub progress: [Option<ProgressUpdate>; 4],
@@ -75,10 +74,9 @@ pub struct DashboardState {
 }
 
 impl DashboardState {
-    fn new(operation: &str, account: &str, profile: &str) -> Self {
+    fn new(operation: &str, profile: &str) -> Self {
         Self {
             operation: operation.to_string(),
-            account: account.to_string(),
             profile: profile.to_string(),
             started: Instant::now(),
             progress: [None, None, None, None],
@@ -149,7 +147,7 @@ impl ProgressReporter {
                 message: message.to_string(),
             }));
         } else {
-            println!("  + {}", message);
+            println!("  + {message}");
         }
     }
 
@@ -160,7 +158,7 @@ impl ProgressReporter {
                 message: message.to_string(),
             }));
         } else {
-            println!("  - {}", message);
+            println!("  - {message}");
         }
     }
 
@@ -171,7 +169,7 @@ impl ProgressReporter {
                 message: message.to_string(),
             }));
         } else {
-            eprintln!("  x {}", message);
+            eprintln!("  x {message}");
         }
     }
 
@@ -197,22 +195,18 @@ impl DashboardHandle {
 /// Run the dashboard in a background task, returning a ProgressReporter and a handle.
 /// When the operation is done, call `reporter.done()` then `handle.wait()` to ensure
 /// the terminal is restored before continuing.
-pub fn start_dashboard(
-    operation: &str,
-    account: &str,
-    profile: &str,
-) -> (ProgressReporter, DashboardHandle) {
+pub fn start_dashboard(operation: &str, profile: &str) -> (ProgressReporter, DashboardHandle) {
     let (tx, rx) = mpsc::unbounded_channel();
     let tty = is_tty();
 
     if tty {
-        let state = Arc::new(Mutex::new(DashboardState::new(operation, account, profile)));
+        let state = Arc::new(Mutex::new(DashboardState::new(operation, profile)));
         let state_clone = state.clone();
 
         // Spawn a thread (not tokio task) for the terminal UI to avoid blocking the async runtime
         let join = std::thread::spawn(move || {
             if let Err(e) = run_tui(state_clone, rx) {
-                eprintln!("UI error: {}", e);
+                eprintln!("UI error: {e}");
             }
         });
 
@@ -263,8 +257,6 @@ fn run_tui(
 
         let done = state.lock().unwrap().done;
         if done {
-            // Show final state for a moment
-            std::thread::sleep(Duration::from_secs(1));
             break;
         }
 
@@ -312,11 +304,46 @@ fn run_tui(
     drop(s);
 
     if !is_done {
-        // User quit mid-operation -- kill the process so the import actually stops
-        std::process::exit(0);
+        // User quit mid-operation: kill the process so the import actually stops,
+        // with the conventional interrupted exit code so scripts don't read it as success.
+        std::process::exit(130);
     }
 
     Ok(())
+}
+
+const LABELS: [&str; 4] = ["Watchlist", "Crunchylists", "Ratings", "History"];
+
+impl DashboardState {
+    /// Past-tense verb for the main counter: exports export, imports add.
+    fn verb(&self) -> &'static str {
+        if self.operation == "Export" {
+            "exported"
+        } else {
+            "added"
+        }
+    }
+
+    fn totals(&self) -> (usize, usize, usize) {
+        self.progress
+            .iter()
+            .flatten()
+            .fold((0, 0, 0), |(a, k, f), p| {
+                (a + p.added, k + p.already_present + p.skipped, f + p.failed)
+            })
+    }
+}
+
+/// "12 added, 3 already there, 1 failed", leaving out zero counts after the first.
+fn counts_text(verb: &str, added: usize, already: usize, failed: usize) -> String {
+    let mut parts = vec![format!("{added} {verb}")];
+    if already > 0 {
+        parts.push(format!("{already} already there"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    parts.join(", ")
 }
 
 /// Draw the dashboard and return the clamped scroll offset for the log panel.
@@ -325,83 +352,98 @@ fn draw_dashboard(f: &mut Frame, state: &DashboardState, scroll_offset: usize) -
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4), // header
-            Constraint::Length(8), // progress gauges
-            Constraint::Min(6),    // log
-            Constraint::Length(3), // stats bar
+            Constraint::Length(1), // header
+            Constraint::Length(1), // spacer
+            Constraint::Length(4), // one row per data type
+            Constraint::Min(4),    // log
+            Constraint::Length(1), // key hints
         ])
         .split(f.area());
 
-    // Header
-    let elapsed = state.started.elapsed();
-    let header = Paragraph::new(vec![
-        Line::from(vec![Span::styled(
+    // Header: operation, profile, elapsed, running totals
+    let elapsed = state.started.elapsed().as_secs();
+    let (added, already, failed) = state.totals();
+    let mut header = vec![
+        Span::styled(
             format!(" {} ", state.operation),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(format!(
-            " {} / {}  |  elapsed: {}m {}s",
-            state.account,
+        ),
+        Span::raw(format!(
+            "{}  {}m{:02}s  ",
             state.profile,
-            elapsed.as_secs() / 60,
-            elapsed.as_secs() % 60,
+            elapsed / 60,
+            elapsed % 60
         )),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" crunchyroll-migrate "),
-    );
-    f.render_widget(header, chunks[0]);
+        Span::styled(
+            counts_text(state.verb(), added, already, failed),
+            Style::default().fg(if failed > 0 { Color::Red } else { Color::Green }),
+        ),
+    ];
+    if state.done {
+        header.push(Span::styled(
+            "  done",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
 
-    // Progress gauges
-    let gauge_area = Layout::default()
+    // One row per data type: name | bar | counts
+    let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
-        ])
-        .split(chunks[1]);
+        .constraints([Constraint::Length(1); 4])
+        .split(chunks[2]);
+    let dim = Style::default().fg(Color::DarkGray);
+    for (i, label) in LABELS.iter().enumerate() {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(15),
+                Constraint::Fill(1),
+                Constraint::Length(2),
+                Constraint::Fill(2),
+            ])
+            .split(rows[i]);
 
-    let labels = ["Watchlist", "Crunchylists", "Ratings", "History"];
-    for (i, label) in labels.iter().enumerate() {
-        let (ratio, info) = match &state.progress[i] {
+        let (ratio, info, style) = match &state.progress[i] {
             Some(p) if p.total > 0 => {
-                let ratio = p.processed as f64 / p.total as f64;
-                let eta_str = format_eta(state.eta(i));
                 let info = format!(
-                    "{}/{} ({} added, {} skip, {} fail){}",
+                    "{}/{}  {}{}",
                     p.processed,
                     p.total,
-                    p.added,
-                    p.skipped + p.already_present,
-                    p.failed,
-                    eta_str
+                    counts_text(
+                        state.verb(),
+                        p.added,
+                        p.already_present + p.skipped,
+                        p.failed
+                    ),
+                    format_eta(state.eta(i))
                 );
-                (ratio, info)
+                let ratio = p.processed as f64 / p.total as f64;
+                (ratio, info, Style::default())
             }
             Some(p) if p.processed > 0 => {
-                // Streaming (unknown total) - show count so far
-                (0.0, format!("{} so far", p.processed))
+                (0.0, format!("{} so far", p.processed), Style::default())
             }
-            Some(_) => (0.0, "0 items".to_string()),
-            None => (0.0, "waiting...".to_string()),
+            Some(_) => (1.0, "nothing to do".to_string(), dim),
+            None => (0.0, "waiting".to_string(), dim),
         };
 
-        let gauge = Gauge::default()
-            .block(Block::default().title(format!(" {} ", label)))
-            .gauge_style(Style::default().fg(Color::Green))
-            .ratio(ratio.clamp(0.0, 1.0))
-            .label(info);
-        f.render_widget(gauge, gauge_area[i]);
+        f.render_widget(Paragraph::new(format!(" {label}")).style(style), cols[0]);
+        f.render_widget(
+            LineGauge::default()
+                .filled_style(Style::default().fg(Color::Green))
+                .unfilled_style(dim)
+                .ratio(ratio.clamp(0.0, 1.0))
+                .label(""),
+            cols[1],
+        );
+        f.render_widget(Paragraph::new(info).style(style), cols[3]);
     }
 
     // Log
-    let visible_lines = chunks[2].height.saturating_sub(2) as usize;
+    let visible_lines = chunks[3].height.saturating_sub(2) as usize;
     let max_scroll = state.log.len().saturating_sub(visible_lines);
     let clamped_offset = scroll_offset.min(max_scroll);
     let start = max_scroll.saturating_sub(clamped_offset);
@@ -423,89 +465,64 @@ fn draw_dashboard(f: &mut Frame, state: &DashboardState, scroll_offset: usize) -
 
     let log_title = if clamped_offset > 0 {
         let last = (start + visible_lines).min(state.log.len());
-        format!(" Log [{}-{}/{}] ", start + 1, last, state.log.len())
+        format!(" Log {}-{} of {} ", start + 1, last, state.log.len())
     } else {
         " Log ".to_string()
     };
-    let log_widget =
-        Paragraph::new(log_lines).block(Block::default().borders(Borders::ALL).title(log_title));
-    f.render_widget(log_widget, chunks[2]);
+    let log_widget = Paragraph::new(log_lines).block(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(dim)
+            .title(log_title),
+    );
+    f.render_widget(log_widget, chunks[3]);
 
-    // Stats bar
-    let mut total_added = 0;
-    let mut total_already = 0;
-    let mut total_failed = 0;
-    for p in state.progress.iter().flatten() {
-        total_added += p.added;
-        total_already += p.already_present + p.skipped;
-        total_failed += p.failed;
-    }
-
-    let stats = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!(" {} added ", total_added),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw("| "),
-        Span::styled(
-            format!("{} skipped ", total_already),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("| "),
-        Span::styled(
-            format!("{} failed ", total_failed),
-            Style::default().fg(Color::Red),
-        ),
-        Span::raw(if state.done { "| DONE" } else { "" }),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
-    f.render_widget(stats, chunks[3]);
+    f.render_widget(
+        Paragraph::new(" q quit  ↑↓ scroll  Home/End jump").style(dim),
+        chunks[4],
+    );
 
     clamped_offset
 }
 
 fn print_final_summary(state: &DashboardState) {
-    let elapsed = state.started.elapsed();
+    let elapsed = state.started.elapsed().as_secs();
     println!(
-        "\n{} complete in {}m {}s\n",
+        "\n{} complete in {}m{:02}s\n",
         state.operation,
-        elapsed.as_secs() / 60,
-        elapsed.as_secs() % 60
+        elapsed / 60,
+        elapsed % 60
     );
 
-    let labels = ["Watchlist", "Crunchylists", "Ratings", "History"];
-    let mut total_added = 0;
-    let mut total_already = 0;
-    let mut total_failed = 0;
-
-    for (i, label) in labels.iter().enumerate() {
+    for (i, label) in LABELS.iter().enumerate() {
         if let Some(p) = &state.progress[i] {
             println!(
-                "  {:14} {} added, {} already there, {} failed",
+                "  {:14} {}",
                 label,
-                p.added,
-                p.already_present + p.skipped,
-                p.failed
+                counts_text(
+                    state.verb(),
+                    p.added,
+                    p.already_present + p.skipped,
+                    p.failed
+                )
             );
-            total_added += p.added;
-            total_already += p.already_present + p.skipped;
-            total_failed += p.failed;
         }
     }
-
-    println!("  {}", "─".repeat(50));
+    let (added, already, failed) = state.totals();
+    println!("  {}", "─".repeat(40));
     println!(
-        "  {:14} {} added, {} already there, {} failed\n",
-        "Total", total_added, total_already, total_failed
+        "  {:14} {}\n",
+        "Total",
+        counts_text(state.verb(), added, already, failed)
     );
 }
 
 fn format_eta(eta: Option<Duration>) -> String {
     match eta {
         Some(d) if d.as_secs() >= 60 => {
-            format!(" | ~{}m{}s left", d.as_secs() / 60, d.as_secs() % 60)
+            format!("  ~{}m{}s left", d.as_secs() / 60, d.as_secs() % 60)
         }
-        Some(d) => format!(" | ~{}s left", d.as_secs()),
+        Some(d) => format!("  ~{}s left", d.as_secs()),
         None => String::new(),
     }
 }
@@ -521,12 +538,22 @@ mod tests {
 
     #[test]
     fn format_eta_seconds() {
-        assert_eq!(format_eta(Some(Duration::from_secs(45))), " | ~45s left");
+        assert_eq!(format_eta(Some(Duration::from_secs(45))), "  ~45s left");
     }
 
     #[test]
     fn format_eta_minutes() {
-        assert_eq!(format_eta(Some(Duration::from_secs(125))), " | ~2m5s left");
+        assert_eq!(format_eta(Some(Duration::from_secs(125))), "  ~2m5s left");
+    }
+
+    #[test]
+    fn counts_text_hides_zero_counts() {
+        assert_eq!(counts_text("added", 5, 0, 0), "5 added");
+        assert_eq!(
+            counts_text("added", 0, 3, 1),
+            "0 added, 3 already there, 1 failed"
+        );
+        assert_eq!(counts_text("exported", 10, 0, 2), "10 exported, 2 failed");
     }
 
     #[test]

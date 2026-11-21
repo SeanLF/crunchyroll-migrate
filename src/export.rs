@@ -4,7 +4,7 @@ use crate::models::{
 };
 use crate::ui::{self, DataType, ProgressReporter, ProgressUpdate};
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use crunchyroll_rs::list::WatchlistOptions;
 use crunchyroll_rs::{Crunchyroll, MediaCollection};
 use futures_util::StreamExt;
@@ -15,8 +15,8 @@ use tokio::sync::Semaphore;
 pub async fn run(crunchy: &Crunchyroll, output_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
-    let profile_name = crunchy.profile_id().await;
-    let (reporter, dashboard) = ui::start_dashboard("Export", "", &profile_name);
+    let profile_name = crate::auth::current_profile_name(crunchy).await;
+    let (reporter, dashboard) = ui::start_dashboard("Export", &profile_name);
 
     let watchlist = export_watchlist(crunchy, &profile_name, &reporter).await?;
     write_atomic(output_dir, "watchlist.json", &watchlist)?;
@@ -49,9 +49,8 @@ pub async fn run(crunchy: &Crunchyroll, output_dir: &Path) -> Result<()> {
     reporter.done();
     dashboard.wait();
 
-    if !ui::is_tty() {
-        println!("Export complete -> {}", output_dir.display());
-    }
+    let shown = std::fs::canonicalize(output_dir).unwrap_or_else(|_| output_dir.to_path_buf());
+    println!("Export saved to {}", shown.display());
     Ok(())
 }
 
@@ -98,6 +97,7 @@ async fn export_history(
     reporter: &ProgressReporter,
 ) -> Result<WatchHistoryExport> {
     let mut stream = crunchy.watch_history();
+    stream.page_size(crate::HISTORY_PAGE_SIZE);
     let mut items = Vec::new();
     let mut failed = 0;
 
@@ -119,7 +119,11 @@ async fn export_history(
                     parent_type: entry.parent_type.clone(),
                     title,
                     series_title,
-                    date_played: entry.date_played,
+                    date_played: DateTime::from_timestamp(
+                        entry.date_played.as_second(),
+                        entry.date_played.subsec_nanosecond() as u32,
+                    )
+                    .unwrap_or_default(),
                     playhead: entry.playhead,
                     fully_watched: entry.fully_watched,
                     partial,
@@ -138,7 +142,7 @@ async fn export_history(
                 }
             }
             Err(e) => {
-                reporter.log_error(&format!("Skipping history entry: {}", e));
+                reporter.log_error(&format!("Skipping history entry: {e}"));
                 failed += 1;
             }
         }
@@ -267,7 +271,7 @@ async fn export_ratings(
         match handle.await {
             Ok(Some(item)) => items.push(item),
             Ok(None) => {}
-            Err(e) => reporter.log_error(&format!("Rating task failed: {}", e)),
+            Err(e) => reporter.log_error(&format!("Rating task failed: {e}")),
         }
         if checked % 5 == 0 || checked == total {
             reporter.progress(ProgressUpdate {
@@ -321,7 +325,7 @@ async fn fetch_rating(
             content_id: content_id.to_string(),
             content_type: content_type.to_string(),
             title: title.to_string(),
-            rating: format!("{:?}", stars),
+            rating: format!("{stars:?}"),
         }),
         Err(_) => None,
     }
@@ -393,7 +397,7 @@ fn export_progress(data_type: DataType, count: usize) -> ProgressUpdate {
 
 fn write_atomic<T: serde::Serialize>(dir: &Path, filename: &str, data: &T) -> Result<()> {
     let target = dir.join(filename);
-    let tmp = dir.join(format!(".{}.tmp", filename));
+    let tmp = dir.join(format!(".{filename}.tmp"));
     let json = serde_json::to_string_pretty(data)?;
     std::fs::write(&tmp, &json).with_context(|| format!("Failed to write {}", tmp.display()))?;
     std::fs::rename(&tmp, &target)

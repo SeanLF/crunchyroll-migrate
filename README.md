@@ -21,7 +21,19 @@ Download a binary from [Releases](../../releases), or build from source:
 cargo install --git https://github.com/SeanLF/crunchyroll-migrate
 ```
 
-Requires nightly Rust (edition 2024).
+Requires Rust 1.85+ (edition 2024).
+
+## Logging in
+
+Crunchyroll no longer lets third-party tools log in with email and password. Instead, use the `etp_rt` cookie from a browser session:
+
+1. Log in at [crunchyroll.com](https://www.crunchyroll.com).
+2. Open devtools: **Application** (Chrome) or **Storage** (Firefox/Safari) > **Cookies** > `https://www.crunchyroll.com`.
+3. Copy the value of `etp_rt`.
+
+The tool prompts for it (input hidden), or takes it via `--cookie`. Pasting `etp_rt=...;` works too. The cookie expires; if login fails, grab a fresh one.
+
+For a migration you need one cookie per account. Use a private window for the second account so logging in doesn't overwrite the first cookie.
 
 ## Usage
 
@@ -46,20 +58,16 @@ Or use subcommands directly:
 Full flow: export from source, diff against target, confirm, import.
 
 ```bash
-crunchyroll-migrate migrate \
-  --source-email old@example.com \
-  --target-email new@example.com
+crunchyroll-migrate migrate
 ```
 
-Prompts for passwords, profile selection, and confirmation interactively. Credentials can also be piped from a password manager:
+Prompts for both cookies, profile selection, and confirmation interactively. Leave the target cookie empty to copy between profiles on the same account (for example into a new profile, which it offers to create). The intermediate export in `./migration` is deleted after a successful import; pass `--keep-data` to keep it as a backup. Everything can also be passed as flags:
 
 ```bash
 crunchyroll-migrate migrate \
-  --source-email old@example.com \
-  --source-password "$(op read 'op://vault/crunchyroll-old/password')" \
+  --source-cookie "$OLD_ETP_RT" \
   --source-profile Sean \
-  --target-email new@example.com \
-  --target-password "$(op read 'op://vault/crunchyroll-new/password')" \
+  --target-cookie "$NEW_ETP_RT" \
   --target-profile Sean
 ```
 
@@ -69,7 +77,7 @@ crunchyroll-migrate migrate \
 crunchyroll-migrate export --output-dir ./backup
 ```
 
-Produces four JSON files: `watchlist.json`, `watch_history.json`, `crunchylists.json`, `ratings.json`.
+Produces four JSON files in `./export` (or `--output-dir`): `watchlist.json`, `watch_history.json`, `crunchylists.json`, `ratings.json`. The full path is printed when it finishes.
 
 ### Import
 
@@ -155,7 +163,7 @@ git config core.hooksPath .githooks
 # Build
 cargo build
 
-# Test (20 tests: model round-trips, retry logic, error classification, UI helpers)
+# Test (model round-trips, retry logic, error classification, cookie parsing, UI helpers)
 cargo test
 
 # Lint

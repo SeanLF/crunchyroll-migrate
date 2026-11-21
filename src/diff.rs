@@ -89,7 +89,11 @@ pub async fn compute_diff(crunchy: &Crunchyroll, input_dir: &Path) -> Result<Dif
         },
         crunchylists: DiffCounts {
             in_export: export_list_count,
-            on_target: target.crunchylists.values().map(|s| s.len()).sum(),
+            on_target: target
+                .crunchylists
+                .values()
+                .map(std::collections::HashSet::len)
+                .sum(),
             missing: export_list_count - list_already,
             already_there: list_already,
         },
